@@ -892,7 +892,10 @@ where
     let dist_client = match dist_compile_cmd.clone().and(dist_client) {
         Some(dc) => dc,
         None => {
-            debug!("[{}]: Compiling locally", out_pretty);
+            info!(
+                "[{}]: Compiling locally (not eligible for distributed compilation)",
+                out_pretty
+            );
             return compile_cmd
                 .execute(service, &creator)
                 .await
@@ -900,7 +903,7 @@ where
         }
     };
 
-    debug!("[{}]: Attempting distributed compilation", out_pretty);
+    info!("[{}]: Attempting distributed compilation", out_pretty);
     let out_pretty2 = out_pretty.clone();
 
     let local_executable = compile_cmd.get_executable();
@@ -1059,6 +1062,12 @@ where
                 .splice(0..0, server_info.as_bytes().to_vec());
         }
 
+        info!(
+            "[{}]: Distributed compilation finished on {} (exit code {})",
+            out_pretty,
+            server_id.addr(),
+            jc.output.code
+        );
         Ok((DistType::Ok(server_id), jc.output.into()))
     };
 
