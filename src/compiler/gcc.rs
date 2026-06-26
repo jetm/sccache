@@ -1108,9 +1108,16 @@ where
     //    device preprocessor outputs and cannot compile preprocessed CUDA files.
     // 3. The dist command does not carry the -arch flags, so a multi-arch
     //    compilation would come back with a single-arch object.
+    // 4. Precompiled-header generation (the input is itself a header, e.g.
+    //    `gcc -c asmjit.hpp -o asmjit.hpp.gch`) must run locally. A .gch built
+    //    from preprocessed source on a remote builder captures a macro state
+    //    (notably __has_builtin, evaluated differently under -fpreprocessed)
+    //    that diverges from a native build and then breaks every consumer that
+    //    -includes the header. distcc refuses PCH for the same reason.
     let dist_command = if has_verbose_flag
         || parsed_args.language == Language::Cuda
         || parsed_args.is_multiarch()
+        || parsed_args.language.is_c_like_header()
     {
         None
     } else {
@@ -3207,6 +3214,72 @@ mod test {
         let _ = command.execute(&service, &creator).wait();
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
+        assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_pch_generation_never_dist() {
+        // Compiling a header (precompiled-header generation, e.g.
+        // `gcc -c asmjit.hpp -o asmjit.hpp.gch`) must never be distributed: a
+        // .gch built from preprocessed source / a remote toolchain captures a
+        // macro state (notably __has_builtin) that differs from a local build
+        // and then poisons every consumer that -includes the header. distcc
+        // refuses PCH for the same reason; we build it locally.
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            uses_external_assembler: false,
+            input: "asmjit.hpp".into(),
+            double_dash_input: false,
+            language: Language::CxxHeader,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "asmjit.hpp.gch".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let compiler = &f.bins[0];
+        // Compiler invocation.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+        let mut path_transformer = dist::PathTransformer::new();
+        let (command, dist_command, cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            // rewrite_includes_only=true: dist is enabled, yet a header still
+            // must not produce a dist command.
+            true,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        assert!(dist_command.is_none());
+        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(Cacheable::Yes, cacheable);
         assert_eq!(0, creator.lock().unwrap().children.len());
     }
 
