@@ -443,6 +443,11 @@ impl SchedulerIncoming for Scheduler {
             // LOCKS
             let mut servers = self.servers.lock().unwrap();
 
+            // R0 instrumentation: snapshot every candidate's load so the
+            // allocation decision logged below exposes the load distribution
+            // across nodes and any first-hashed-server tie bias.
+            let mut candidate_loads: Vec<(ServerId, f64, usize, usize)> = Vec::new();
+
             let res = {
                 let mut best = None;
                 let mut best_err = None;
@@ -450,6 +455,12 @@ impl SchedulerIncoming for Scheduler {
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
                     let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
+                    candidate_loads.push((
+                        server_id,
+                        load,
+                        details.jobs_assigned.len(),
+                        details.num_cpus,
+                    ));
 
                     if let Some(last_error) = details.last_error {
                         if load < MAX_PER_CORE_LOAD {
@@ -509,6 +520,15 @@ impl SchedulerIncoming for Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
+                    info!(
+                        "dist-alloc: job {} -> {:?} (now {}/{} jobs, load {:.3}); candidates {:?}",
+                        job_id,
+                        server_id,
+                        server_details.jobs_assigned.len(),
+                        server_details.num_cpus,
+                        load_weight(server_details.jobs_assigned.len(), server_details.num_cpus),
+                        candidate_loads,
+                    );
                     let auth = server_details
                         .job_authorizer
                         .generate_token(job_id)
@@ -526,6 +546,7 @@ impl SchedulerIncoming for Scheduler {
                     "Insufficient capacity across {} available servers",
                     servers.len()
                 );
+                warn!("dist-alloc: {}; candidates {:?}", msg, candidate_loads);
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
@@ -741,6 +762,18 @@ impl SchedulerIncoming for Scheduler {
         let mut servers = self.servers.lock().unwrap();
 
         self.prune_servers(&mut servers, &mut jobs);
+
+        // R0 instrumentation: one-line status snapshot per poll so the
+        // in-progress cadence across nodes is recoverable from the log.
+        let status_snapshot: Vec<(String, usize, usize)> = servers
+            .iter()
+            .map(|(id, d)| (id.addr().to_string(), d.jobs_assigned.len(), d.num_cpus))
+            .collect();
+        info!(
+            "dist-status poll: {} in-progress jobs; servers {:?}",
+            jobs.len(),
+            status_snapshot
+        );
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
