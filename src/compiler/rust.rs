@@ -2302,13 +2302,15 @@ impl pkg::InputsPackager for RustInputsPackager {
                         Some(name) => {
                             let mut rev_name_split = name.rsplitn(2, '-');
                             let _extra_filename_and_ext = rev_name_split.next();
-                            let libname = if let Some(libname) = rev_name_split.next() {
+                            if let Some(libname) = rev_name_split.next() {
+                                assert!(rev_name_split.next().is_none());
                                 libname
                             } else {
-                                continue;
-                            };
-                            assert!(rev_name_split.next().is_none());
-                            libname
+                                // No `-<hash>` suffix (e.g. an OE target sysroot's
+                                // libstd.rlib): fall back to the name with its
+                                // extension stripped so std still ships.
+                                name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name)
+                            }
                         }
                         None => continue,
                     };
