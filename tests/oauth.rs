@@ -57,6 +57,8 @@ fn config_with_dist_auth(
             toolchains: vec![],
             toolchain_cache_size: 0,
             rewrite_includes_only: true,
+            client_deserialize_offload_threshold: 1024 * 1024,
+            run_job_compression_level: 1,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],

@@ -119,6 +119,12 @@ fn default_disk_cache_size() -> u64 {
 fn default_toolchain_cache_size() -> u64 {
     TEN_GIGS
 }
+fn default_client_deserialize_offload_threshold() -> u64 {
+    1024 * 1024
+}
+fn default_run_job_compression_level() -> u32 {
+    1
+}
 
 struct StringOrU64Visitor;
 
@@ -774,6 +780,9 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    #[serde(deserialize_with = "deserialize_size_from_str")]
+    pub client_deserialize_offload_threshold: u64,
+    pub run_job_compression_level: u32,
 }
 
 impl Default for DistConfig {
@@ -785,6 +794,8 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            client_deserialize_offload_threshold: default_client_deserialize_offload_threshold(),
+            run_job_compression_level: default_run_job_compression_level(),
         }
     }
 }
@@ -2982,6 +2993,8 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                client_deserialize_offload_threshold: 1024 * 1024,
+                run_job_compression_level: 1,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
