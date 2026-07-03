@@ -3709,6 +3709,7 @@ version = "0.17.0"
 dependencies = [
  "anyhow",
  "ar",
+ "arc-swap",
  "assert_cmd",
  "async-trait",
  "backon",
