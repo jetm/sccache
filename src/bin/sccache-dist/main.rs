@@ -891,14 +891,13 @@ impl SchedulerIncoming for Scheduler {
                 let active_set: HashSet<JobId> = active_jobs.into_iter().collect();
                 let mut liveness_reap = Vec::new();
                 for &job_id in details.jobs_assigned.iter() {
-                    if let Some(detail) = jobs.get(&job_id) {
-                        if detail.state == JobState::Started
-                            && !active_set.contains(&job_id)
-                            && !details.last_active_jobs.contains(&job_id)
-                            && now.duration_since(detail.since) > LIVENESS_GRACE
-                        {
-                            liveness_reap.push(job_id);
-                        }
+                    if let Some(detail) = jobs.get(&job_id)
+                        && detail.state == JobState::Started
+                        && !active_set.contains(&job_id)
+                        && !details.last_active_jobs.contains(&job_id)
+                        && now.duration_since(detail.since) > LIVENESS_GRACE
+                    {
+                        liveness_reap.push(job_id);
                     }
                 }
                 if !liveness_reap.is_empty() {
@@ -926,25 +925,24 @@ impl SchedulerIncoming for Scheduler {
                 // stopped naming the job in its heartbeats.
                 let mut stale_started = Vec::new();
                 for &job_id in details.jobs_assigned.iter() {
-                    if let Some(detail) = jobs.get(&job_id) {
-                        if detail.state == JobState::Started
-                            && now.duration_since(detail.since) > STARTED_COMPLETE_TIMEOUT
-                        {
-                            if details.last_active_jobs.contains(&job_id) {
-                                // Still reported active past the backstop timeout:
-                                // not reaped (a genuinely-slow live compile must
-                                // survive) but likely a wedged build the server
-                                // names forever. Surface it so it is visible in
-                                // logs rather than silently accumulating.
-                                warn!(
-                                    "Started job {} on server {} still reported active past {:?}; possible wedged build",
-                                    job_id,
-                                    server_id.addr(),
-                                    STARTED_COMPLETE_TIMEOUT
-                                );
-                            } else {
-                                stale_started.push(job_id);
-                            }
+                    if let Some(detail) = jobs.get(&job_id)
+                        && detail.state == JobState::Started
+                        && now.duration_since(detail.since) > STARTED_COMPLETE_TIMEOUT
+                    {
+                        if details.last_active_jobs.contains(&job_id) {
+                            // Still reported active past the backstop timeout:
+                            // not reaped (a genuinely-slow live compile must
+                            // survive) but likely a wedged build the server
+                            // names forever. Surface it so it is visible in
+                            // logs rather than silently accumulating.
+                            warn!(
+                                "Started job {} on server {} still reported active past {:?}; possible wedged build",
+                                job_id,
+                                server_id.addr(),
+                                STARTED_COMPLETE_TIMEOUT
+                            );
+                        } else {
+                            stale_started.push(job_id);
                         }
                     }
                 }
@@ -1064,10 +1062,10 @@ impl SchedulerIncoming for Scheduler {
                     // than allocation time, so time spent uploading a toolchain
                     // (Pending) does not consume the claim budget and a job that
                     // is still uploading is not reaped as a no-show.
-                    if let Some(details) = server_details {
-                        if let Some(t) = details.jobs_unclaimed.get_mut(&job_id) {
-                            *t = now;
-                        }
+                    if let Some(details) = server_details
+                        && let Some(t) = details.jobs_unclaimed.get_mut(&job_id)
+                    {
+                        *t = now;
                     }
                     let detail = entry.get_mut();
                     detail.state = job_state;

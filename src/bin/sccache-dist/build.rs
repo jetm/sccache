@@ -758,10 +758,10 @@ impl DockerBuilder {
                 }
                 // Docker diff paths are in alphabetical order and we do `rm -rf`, so we might be able to skip
                 // calling Docker more than necessary (since it's slow)
-                if let Some(lastpath) = lastpath {
-                    if Path::new(changepath).starts_with(lastpath) {
-                        continue;
-                    }
+                if let Some(lastpath) = lastpath
+                    && Path::new(changepath).starts_with(lastpath)
+                {
+                    continue;
                 }
                 lastpath = Some(changepath);
                 if let Err(e) = Command::new("docker")
@@ -846,7 +846,7 @@ impl DockerBuilder {
             .context("Failed to copy toolchain tar into container")?;
         drop(toolchain_rdr);
 
-        let imagename = format!("sccache-builder-{}", &tc.archive_id);
+        let imagename = format!("sccache-builder-{}", tc.archive_id);
         Command::new("docker")
             .args(["commit", &cid, &imagename])
             .check_run()
