@@ -724,7 +724,7 @@ impl DockerBuilder {
             .context("Failed to copy toolchain tar into container")?;
         drop(toolchain_rdr);
 
-        let imagename = format!("sccache-builder-{}", &tc.archive_id);
+        let imagename = format!("sccache-builder-{}", tc.archive_id);
         Command::new("docker")
             .args(["commit", &cid, &imagename])
             .check_run()

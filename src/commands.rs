@@ -164,7 +164,7 @@ fn create_error_log() -> Result<File> {
     let f = match OpenOptions::new().create(true).append(true).open(&name) {
         Ok(f) => f,
         Err(_) => {
-            bail!("Cannot open/write log file '{}'", &name);
+            bail!("Cannot open/write log file '{}'", name);
         }
     };
     Ok(f)
@@ -746,7 +746,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     continue;
                 }
                 println!("=========================");
-                println!("Showing preprocessor entry file {}", &path.display());
+                println!("Showing preprocessor entry file {}", path.display());
                 let contents = std::fs::read(path)?;
                 let preprocessor_cache_entry =
                     crate::compiler::PreprocessorCacheEntry::read(&contents)?;

@@ -1564,7 +1564,7 @@ where
                         // take the pathbuf for rustc as resolved by the proxy
                         match proxy.resolve_proxied_executable(creator1, cwd, env).await {
                             Ok((resolved_path, _time)) => {
-                                trace!("Resolved path with rustup proxy {:?}", &resolved_path);
+                                trace!("Resolved path with rustup proxy {:?}", resolved_path);
                                 Ok((Some(proxy), resolved_path))
                             }
                             Err(e) => {

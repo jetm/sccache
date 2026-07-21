@@ -405,6 +405,9 @@ impl CommandChild for MockChild {
 
 pub enum ChildOrCall {
     Child(Result<MockChild>),
+    // The closure is invoked via f(&self.args) in the mock spawn path; a
+    // newer clippy's dead-code pass flags the field even though it is called.
+    #[allow(dead_code)]
     Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
 }
 

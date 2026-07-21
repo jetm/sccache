@@ -553,7 +553,7 @@ where
 
             let mut preprocessor_result = result.or_else(move |err| {
                 // Errors remove all traces of potential output.
-                debug!("removing files {:?}", &outputs);
+                debug!("removing files {:?}", outputs);
 
                 let v: std::result::Result<(), std::io::Error> =
                     outputs.values().try_for_each(|output| {
