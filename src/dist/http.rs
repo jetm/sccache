@@ -742,10 +742,10 @@ mod server {
                 cert_digest: Vec<u8>,
                 cert_pem: Vec<u8>,
             ) -> Result<()> {
-                if let Some((saved_cert_digest, _)) = certs.get(&server_id) {
-                    if saved_cert_digest == &cert_digest {
-                        return Ok(());
-                    }
+                if let Some((saved_cert_digest, _)) = certs.get(&server_id)
+                    && saved_cert_digest == &cert_digest
+                {
+                    return Ok(());
                 }
                 info!(
                     "Adding new certificate for {} to scheduler",
