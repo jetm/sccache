@@ -335,6 +335,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         Box::new(CToolchainPackager {
             executable: self.executable.clone(),
             kind: self.compiler.kind(),
+            // `CCompiler` carries no compile environment; the standalone
+            // `--package-toolchain` path keeps resolving against the daemon's
+            // PATH. The dist-compile path threads the task env via
+            // `into_dist_packagers`.
+            env_vars: Vec::new(),
         })
     }
     fn parse_arguments(
@@ -533,10 +538,10 @@ where
                         // the toolchain will not contain the correct path
                         // to invoke the compiler! Add the compiler
                         // executable path to try and prevent this
-                        let weak_toolchain_key = format!(
-                            "{}-{}",
-                            self.executable.to_string_lossy(),
-                            self.executable_digest
+                        let weak_toolchain_key = c_weak_toolchain_key(
+                            &self.executable,
+                            &self.executable_digest,
+                            &env_vars,
                         );
                         return Ok(HashResult {
                             key,
@@ -690,11 +695,8 @@ where
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
         // executable path to try and prevent this
-        let weak_toolchain_key = format!(
-            "{}-{}",
-            self.executable.to_string_lossy(),
-            self.executable_digest
-        );
+        let weak_toolchain_key =
+            c_weak_toolchain_key(&self.executable, &self.executable_digest, &env_vars);
         Ok(HashResult {
             key,
             compilation: Box::new(CCompilation {
@@ -1247,6 +1249,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             preprocessed_input,
             executable,
             compiler,
+            env_vars,
             ..
         } = *self;
         trace!("Dist inputs: {:?}", parsed_args.input);
@@ -1262,6 +1265,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
+            env_vars,
         });
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
@@ -1353,11 +1357,53 @@ impl pkg::InputsPackager for CInputsPackager {
     }
 }
 
+/// Environment variables that decide which sub-tools and search directories a
+/// packaged C toolchain contains: the compile PATH its sub-tools resolve against
+/// and the variables the compiler consults when asked where its own tools live.
+const TOOLCHAIN_ENV_VARS: &[&str] = &["PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "LIBRARY_PATH"];
+
+/// Key under which a packaged toolchain is cached on the client. A compiler binary
+/// may be a symlink to another and so has the same digest, but the toolchain would
+/// not contain the path the compiler is invoked by, so the executable path is part
+/// of the key. The package also depends on the compile task's environment (see
+/// `TOOLCHAIN_ENV_VARS`), so those variables are too.
+fn c_weak_toolchain_key(
+    executable: &Path,
+    executable_digest: &str,
+    env_vars: &[(OsString, OsString)],
+) -> String {
+    let mut key = format!("{}-{}", executable.to_string_lossy(), executable_digest);
+    for name in TOOLCHAIN_ENV_VARS {
+        if let Some((_, value)) = env_vars.iter().find(|(k, _)| k == name) {
+            key.push_str(&format!("-{}={}", name, value.to_string_lossy()));
+        }
+    }
+    key
+}
+
+/// Resolve a program path reported by `-print-prog-name`/`-print-file-name`.
+/// Absolute paths are returned unchanged; a bare program name is resolved
+/// against `path_env` (the compile task's PATH) when supplied, so an OE native
+/// or cross gcc that reports a bare `as` packages the recipe's binutils rather
+/// than the build host's. Falls back to the daemon's PATH when no compile PATH
+/// is available.
+#[cfg(feature = "dist-client")]
+fn resolve_prog_in_path(raw: PathBuf, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    if raw.is_absolute() {
+        Some(raw)
+    } else if let Some(path) = path_env {
+        which::which_in(&raw, Some(path), std::env::current_dir().ok()?).ok()
+    } else {
+        which::which(raw).ok()
+    }
+}
+
 #[cfg(feature = "dist-client")]
 #[allow(unused)]
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
+    env_vars: Vec<(OsString, OsString)>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -1374,11 +1420,21 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         package_builder.add_common()?;
         package_builder.add_executable_and_deps(self.executable.clone())?;
 
+        // PATH from the compile task's environment. Resolving sub-tools against
+        // it (rather than the daemon's PATH) is what keeps an OE native or cross
+        // toolchain from packaging the build host's assembler.
+        let path_env = self
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == OsStr::new("PATH"))
+            .map(|(_, v)| v.clone());
+
         // Helper to use -print-file-name and -print-prog-name to look up
         // files by path.
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
             let mut output = process::Command::new(&self.executable)
                 .arg(format!("-print-{}-name={}", kind, name))
+                .envs(self.env_vars.iter().cloned())
                 .output()
                 .ok()?;
             debug!(
@@ -1398,14 +1454,11 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 output.stdout.pop();
             }
 
-            // Create our PathBuf from the raw bytes.  Assume that relative
-            // paths can be found via PATH.
+            // Create our PathBuf from the raw bytes.  Relative paths are
+            // resolved against the compile task's PATH, falling back to the
+            // daemon's PATH when none was captured.
             let path: PathBuf = OsString::from_vec(output.stdout).into();
-            if path.is_absolute() {
-                Some(path)
-            } else {
-                which::which(path).ok()
-            }
+            resolve_prog_in_path(path, path_env.as_deref())
         };
 
         // Helper to add a named file/program by to the package.
@@ -1649,6 +1702,80 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_resolve_prog_in_path_honors_supplied_path() {
+        use crate::test::utils::mk_bin;
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_tc")
+            .tempdir()
+            .unwrap();
+        let prog = mk_bin(dir.path(), "sccache-fake-as").unwrap();
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+
+        // A bare program name resolves against the supplied compile PATH, not
+        // the daemon's PATH. This is the toolchain-packaging bug: an OE native
+        // or cross gcc reports a bare `as`, which must resolve to the recipe's
+        // binutils on the compile PATH, not the build host's /usr/bin/as.
+        let resolved =
+            resolve_prog_in_path(PathBuf::from("sccache-fake-as"), Some(path_env.as_os_str()));
+        assert_eq!(
+            resolved.map(|p| p.canonicalize().unwrap()),
+            Some(prog.clone())
+        );
+
+        // Without the compile PATH, the daemon PATH cannot find this program.
+        let unresolved = resolve_prog_in_path(PathBuf::from("sccache-fake-as"), None);
+        assert_eq!(unresolved, None);
+
+        // An absolute path passes through untouched.
+        let absolute = resolve_prog_in_path(prog.clone(), Some(path_env.as_os_str()));
+        assert_eq!(absolute, Some(prog));
+    }
+
+    // The packaged toolchain resolves its sub-tools through the compile task's
+    // PATH and the compiler's own search variables, so a toolchain cached under a
+    // key that ignores them would be reused for a task whose sub-tools differ.
+    #[test]
+    fn test_weak_toolchain_key_follows_the_variables_that_shape_the_package() {
+        let exe = Path::new("/usr/bin/gcc");
+        let env = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs.iter().map(|(k, v)| (k.into(), v.into())).collect()
+        };
+        let base = c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b")]));
+
+        assert_eq!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/c")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(
+                exe,
+                "abcd",
+                &env(&[("PATH", "/a:/b"), ("COMPILER_PATH", "/tools")])
+            )
+        );
+        // Variables that do not change which tools are found leave the key alone.
+        assert_eq!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b"), ("HOME", "/root")]))
+        );
+        // The executable path and digest still separate symlinked compilers.
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(Path::new("/usr/bin/cc"), "abcd", &env(&[("PATH", "/a:/b")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(exe, "ef01", &env(&[("PATH", "/a:/b")]))
+        );
+    }
 
     #[test]
     fn test_same_content() {
