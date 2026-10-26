@@ -1056,7 +1056,7 @@ where
                 )
             })?;
 
-        let jc = match jres {
+        let mut jc = match jres {
             dist::RunJobResult::Complete(jc) => jc,
             dist::RunJobResult::JobNotFound => bail!("Job {} not found on server", job_id),
         };
@@ -1167,6 +1167,17 @@ where
                 server_id.addr(),
                 missing.display()
             );
+        }
+
+        if jc.output.code != 0 {
+            // Reached only with the fallback switch off, where the remote result is
+            // reported to the client as release 0.19.0 does.
+            // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
+            // Failed builds are not cached so this tampering should not cause too much trouble.
+            let server_info = format!("sccache: Job failed on server {}:\n", server_id.addr());
+            jc.output
+                .stderr
+                .splice(0..0, server_info.as_bytes().to_vec());
         }
 
         let ms_run_fetch = t_run.elapsed().as_millis();
@@ -3929,6 +3940,8 @@ LLVM version: 6.0",
         }
         assert_eq!(res.status.code(), Some(1));
         assert!(res.stderr.ends_with(b"remote stderr"));
+        // As in 0.19.0, a reported remote failure names the server that produced it.
+        assert!(res.stderr.starts_with(b"sccache: Job failed on server "));
     }
 
     #[test_case(true ; "with preprocessor cache")]
