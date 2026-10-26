@@ -65,6 +65,72 @@ fn test_process_output_roundtrip_is_not_a_signal() {
     }
 }
 
+/// A stock scheduler sends only the three aggregate counts, positionally. A client
+/// that insisted on the per-server list would fail to decode that and never
+/// distribute against it, so the missing list decodes as empty.
+#[test]
+fn scheduler_status_decodes_a_stock_schedulers_aggregate_only_payload() {
+    let stock = bincode::serialize(&(2usize, 64usize, 3usize)).unwrap();
+
+    let status = SchedulerStatusResult::from_bincode(&stock).unwrap();
+
+    assert_eq!(status.num_servers, 2);
+    assert_eq!(status.num_cpus, 64);
+    assert_eq!(status.in_progress, 3);
+    assert!(status.servers.is_empty());
+}
+
+#[test]
+fn scheduler_status_decodes_the_per_server_payload_in_full() {
+    let sent = SchedulerStatusResult {
+        num_servers: 1,
+        num_cpus: 32,
+        in_progress: 1,
+        servers: vec![ServerStatusResult {
+            id: "10.42.0.1:10501".to_string(),
+            num_cpus: 32,
+            in_progress: 1,
+        }],
+    };
+    let bytes = bincode::serialize(&sent).unwrap();
+
+    let status = SchedulerStatusResult::from_bincode(&bytes).unwrap();
+
+    assert_eq!(status.servers.len(), 1);
+    assert_eq!(status.servers[0].id, "10.42.0.1:10501");
+}
+
+/// The status route needs no credentials, and the per-server list names every
+/// build server's address, so an unauthenticated caller gets the aggregate counts
+/// only.
+#[test]
+fn scheduler_status_without_server_list_keeps_only_the_aggregate_counts() {
+    let full = SchedulerStatusResult {
+        num_servers: 1,
+        num_cpus: 32,
+        in_progress: 1,
+        servers: vec![ServerStatusResult {
+            id: "10.42.0.1:10501".to_string(),
+            num_cpus: 32,
+            in_progress: 1,
+        }],
+    };
+
+    let redacted = full.without_server_list();
+
+    assert_eq!(redacted.num_servers, 1);
+    assert_eq!(redacted.num_cpus, 32);
+    assert_eq!(redacted.in_progress, 1);
+    assert!(redacted.servers.is_empty());
+}
+
+#[test]
+fn scheduler_status_rejects_a_truncated_payload() {
+    let truncated = bincode::serialize(&(2usize, 64usize)).unwrap();
+
+    assert!(SchedulerStatusResult::from_bincode(&truncated).is_err());
+}
+
 /// The JSON shape emitted by `sccache --dist-status` is a contract consumed by
 /// the bakar cluster-info preflight (`_parse_cluster_status`): a top-level
 /// `servers` array of `{id, num_cpus, in_progress}` objects alongside the

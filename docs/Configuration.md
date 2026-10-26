@@ -46,6 +46,12 @@ toolchain_cache_size = 5368709120
 # binary that predates this key rejects a configuration containing it,
 # because unknown keys are denied.
 fallback = true
+# responses larger than this many bytes are deserialized on a blocking thread
+# so they do not stall the async client. Default: 1048576 (1 MiB).
+client_deserialize_offload_threshold = 1048576
+# zlib level used to compress the inputs sent for a distributed compile:
+# 0 disables compression, 1 to 9 select the zlib level. Default: 1.
+run_job_compression_level = 1
 cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]

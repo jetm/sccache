@@ -168,6 +168,8 @@ pub struct DistClientConfig {
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
     fallback: bool,
+    deserialize_offload_threshold: u64,
+    run_job_compression_level: u32,
 }
 
 #[cfg(feature = "dist-client")]
@@ -225,6 +227,8 @@ impl DistClientContainer {
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
             fallback: config.dist.fallback,
+            deserialize_offload_threshold: config.dist.client_deserialize_offload_threshold,
+            run_job_compression_level: config.dist.run_job_compression_level,
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -391,6 +395,8 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
+                    config.deserialize_offload_threshold,
+                    config.run_job_compression_level,
                 )
                 .map(|client| client.with_fallback(config.fallback));
                 let dist_client =
@@ -1108,6 +1114,8 @@ where
                     toolchains: vec![],
                     rewrite_includes_only: false,
                     fallback: true,
+                    deserialize_offload_threshold: 1024 * 1024,
+                    run_job_compression_level: 1,
                 }),
                 dist_client,
             ))),
@@ -2634,6 +2642,8 @@ mod tests {
             toolchains: vec![],
             rewrite_includes_only: false,
             fallback: true,
+            deserialize_offload_threshold: 1024 * 1024,
+            run_job_compression_level: 1,
         };
         let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
             Box::new(config),

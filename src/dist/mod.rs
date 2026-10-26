@@ -606,6 +606,39 @@ pub struct SchedulerStatusResult {
     pub servers: Vec<ServerStatusResult>,
 }
 
+impl SchedulerStatusResult {
+    /// The aggregate counts alone, for a caller that has not authenticated: the
+    /// per-server list names every build server's address.
+    pub fn without_server_list(mut self) -> Self {
+        self.servers.clear();
+        self
+    }
+
+    /// Decode a scheduler's bincode status response. A stock scheduler sends only
+    /// the three aggregate counts, and bincode is positional, so the per-server
+    /// list is missing from its payload rather than defaulted; accept that and
+    /// leave the list empty so a client with the breakdown still works against it.
+    pub fn from_bincode(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct AggregateOnly {
+            num_servers: usize,
+            num_cpus: usize,
+            in_progress: usize,
+        }
+        match bincode::deserialize::<SchedulerStatusResult>(bytes) {
+            Ok(status) => Ok(status),
+            Err(full_err) => bincode::deserialize::<AggregateOnly>(bytes)
+                .map(|agg| SchedulerStatusResult {
+                    num_servers: agg.num_servers,
+                    num_cpus: agg.num_cpus,
+                    in_progress: agg.in_progress,
+                    servers: vec![],
+                })
+                .map_err(|_| full_err.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerStatusResult {

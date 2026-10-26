@@ -65,13 +65,15 @@ mod common {
         }
     }
 
+    // Send the request and return the body of a successful response, mapping an
+    // error status to the same errors bincode_req_fut reports.
     #[cfg(feature = "dist-client")]
-    pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + 'static>(
-        req: reqwest::RequestBuilder,
-    ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let res = req.header(header::CONNECTION, "close").send().await?;
+    async fn success_body_fut(req: reqwest::RequestBuilder) -> Result<bytes::Bytes> {
+        // A5: keep-alive is left enabled (no `Connection: close`), so a reused
+        // connection reaches tiny_http, which risks issue #151 (pipeline/body
+        // desync) surfacing as bincode decode errors under soak. Revert point:
+        // re-add `.header(header::CONNECTION, "close")` on the request below.
+        let res = req.send().await?;
 
         let status = res.status();
         let bytes = res.bytes().await?;
@@ -86,6 +88,28 @@ mod common {
             } else {
                 anyhow::bail!(errmsg);
             }
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "dist-client")]
+    pub async fn scheduler_status_req_fut(
+        req: reqwest::RequestBuilder,
+    ) -> Result<dist::SchedulerStatusResult> {
+        dist::SchedulerStatusResult::from_bincode(&success_body_fut(req).await?)
+    }
+
+    #[cfg(feature = "dist-client")]
+    pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + Send + 'static>(
+        req: reqwest::RequestBuilder,
+        deserialize_offload_threshold: u64,
+    ) -> Result<T> {
+        let bytes = success_body_fut(req).await?;
+        if bytes.len() as u64 > deserialize_offload_threshold {
+            // Deserializing a multi-MB blob inline stalls this async worker from
+            // polling other in-flight requests; offload large payloads to a
+            // blocking thread so the reactor keeps making progress.
+            Ok(tokio::task::spawn_blocking(move || bincode::deserialize(&bytes)).await??)
         } else {
             Ok(bincode::deserialize(&bytes)?)
         }
@@ -280,9 +304,9 @@ mod server {
     pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
         req: reqwest::blocking::RequestBuilder,
     ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let mut res = req.header(reqwest::header::CONNECTION, "close").send()?;
+        // Keep-alive is left enabled (no `Connection: close`) so the connection
+        // pool can reuse this socket for the next coordination call.
+        let mut res = req.send()?;
         let status = res.status();
         let mut body = vec![];
         res.copy_to(&mut body)
@@ -756,9 +780,11 @@ mod server {
                 }
                 // Finish the client
                 let new_client = client_builder
-                    // Disable connection pool to avoid broken connection
-                    // between runtime
-                    .pool_max_idle_per_host(0)
+                    // Keep a small idle pool so keep-alive connections are
+                    // reused across coordination calls; expire them under the
+                    // LAN idle limit to avoid reusing a half-closed socket.
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(90))
                     .build()
                     .context("failed to create a HTTP client")?;
                 // Use the updated certificates
@@ -843,6 +869,12 @@ mod server {
                     },
                     (GET) (/api/v1/scheduler/status) => {
                         let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
+                        // The route stays open for the aggregate counts a stock
+                        // client reads, but the per-server list names every build
+                        // server's address, so it needs a valid client token.
+                        let authenticated = bearer_http_auth(request)
+                            .is_some_and(|token| check_client_auth.check(token).is_ok());
+                        let res = if authenticated { res } else { res.without_server_list() };
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v1/scheduler/deregister_server) => {
@@ -983,7 +1015,10 @@ mod server {
             install_shutdown_handler();
             thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
-                    .pool_max_idle_per_host(0)
+                    // Keep a small idle pool with a sub-LAN-limit idle timeout
+                    // so keep-alive connections are reused, not rebuilt.
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(90))
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("deregister http client must build");
@@ -1160,6 +1195,7 @@ mod client {
         SchedulerStatusResult, SubmitToolchainResult, Toolchain,
     };
 
+    use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::Compression;
@@ -1174,7 +1210,7 @@ mod client {
 
     use super::common::{
         AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, bincode_req_fut,
+        ServerCertificateHttpResponse, bincode_req_fut, scheduler_status_req_fut,
     };
     use super::urls;
     use crate::errors::*;
@@ -1183,19 +1219,32 @@ mod client {
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
 
+    // Map a config level to a zlib setting: 0 disables compression (for
+    // measurement on a fast LAN), 1-9 select the zlib level. Level 1 reproduces
+    // the historical `Compression::fast()` default.
+    fn run_job_compression(level: u32) -> Compression {
+        match level {
+            0 => Compression::none(),
+            l => Compression::new(l.min(9)),
+        }
+    }
+
     pub struct Client {
         auth_token: String,
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        client: Arc<Mutex<reqwest::Client>>,
+        client: Arc<ArcSwap<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
         fallback: bool,
+        deserialize_offload_threshold: u64,
+        run_job_compression_level: u32,
     }
 
     impl Client {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             pool: &tokio::runtime::Handle,
             scheduler_url: reqwest::Url,
@@ -1204,15 +1253,19 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            deserialize_offload_threshold: u64,
+            run_job_compression_level: u32,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
             let client = new_reqwest_client_builder()?
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
-                // Disable connection pool to avoid broken connection
-                // between runtime
-                .pool_max_idle_per_host(0)
+                // Keep a small idle pool so keep-alive connections are reused
+                // across coordination calls; expire them under the LAN idle
+                // limit to avoid reusing a half-closed socket.
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(90))
                 .build()
                 .context("failed to create an async HTTP client")?;
             let client_toolchains =
@@ -1222,11 +1275,13 @@ mod client {
                 auth_token,
                 scheduler_url,
                 server_certs: Default::default(),
-                client: Arc::new(Mutex::new(client)),
+                client: Arc::new(ArcSwap::from_pointee(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
                 fallback: true,
+                deserialize_offload_threshold,
+                run_job_compression_level,
             })
         }
 
@@ -1237,7 +1292,7 @@ mod client {
         }
 
         fn update_certs(
-            client: &mut reqwest::Client,
+            client: &ArcSwap<reqwest::Client>,
             certs: &mut HashMap<Vec<u8>, Vec<u8>>,
             cert_digest: Vec<u8>,
             cert_pem: Vec<u8>,
@@ -1257,12 +1312,15 @@ mod client {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
-                // Disable keep-alive
-                .pool_max_idle_per_host(0)
+                // Keep a small idle pool so keep-alive connections are reused;
+                // expire them under the LAN idle limit.
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(90))
                 .build()
                 .context("failed to create an async HTTP client")?;
-            // Use the updated certificates
-            *client = new_client_async;
+            // Hot-swap the client without holding a lock across the rebuild, so
+            // in-flight requests keep serving off the old client until the swap.
+            client.store(Arc::new(new_client_async));
             certs.insert(cert_digest, cert_pem);
             Ok(())
         }
@@ -1273,13 +1331,13 @@ mod client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url);
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = self.client.load().post(url);
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
             let client = self.client.clone();
             let server_certs = self.server_certs.clone();
 
-            match bincode_req_fut(req).await? {
+            match bincode_req_fut(req, self.deserialize_offload_threshold).await? {
                 AllocJobHttpResponse::Success {
                     job_alloc,
                     need_toolchain,
@@ -1298,10 +1356,11 @@ mod client {
                         server_id.addr()
                     );
                     let url = urls::scheduler_server_certificate(&scheduler_url, server_id);
-                    let req = client.lock().unwrap().get(url);
-                    let res: ServerCertificateHttpResponse = bincode_req_fut(req)
-                        .await
-                        .context("GET to scheduler server_certificate failed")?;
+                    let req = client.load().get(url);
+                    let res: ServerCertificateHttpResponse =
+                        bincode_req_fut(req, self.deserialize_offload_threshold)
+                            .await
+                            .context("GET to scheduler server_certificate failed")?;
 
                     // TODO: Move to asynchronous reqwest client only.
                     // This function internally builds a blocking reqwest client;
@@ -1314,7 +1373,7 @@ mod client {
                         .pool
                         .spawn_blocking(move || {
                             Self::update_certs(
-                                &mut client.lock().unwrap(),
+                                &client,
                                 &mut server_certs.lock().unwrap(),
                                 res.cert_digest,
                                 res.cert_pem,
@@ -1333,8 +1392,13 @@ mod client {
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_status(&scheduler_url);
-            let req = self.client.lock().unwrap().get(url);
-            bincode_req_fut(req).await
+            // The token earns the per-server list; the aggregate needs none.
+            let req = self
+                .client
+                .load()
+                .get(url)
+                .bearer_auth(self.auth_token.clone());
+            scheduler_status_req_fut(req).await
         }
 
         async fn do_submit_toolchain(
@@ -1345,12 +1409,12 @@ mod client {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
                     let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
-                    let req = self.client.lock().unwrap().post(url);
+                    let req = self.client.load().post(url);
                     let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
                     let body = Body::wrap_stream(toolchain_file_stream);
                     let req = req.bearer_auth(job_alloc.auth).body(body);
-                    bincode_req_fut(req).await
+                    bincode_req_fut(req, self.deserialize_offload_threshold).await
                 }
                 Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
                 Err(e) => Err(e),
@@ -1365,6 +1429,7 @@ mod client {
             inputs_packager: Box<dyn InputsPackager>,
         ) -> Result<(RunJobResult, PathTransformer)> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+            let compression = run_job_compression(self.run_job_compression_level);
 
             let (body, path_transformer) = self
                 .pool
@@ -1380,7 +1445,7 @@ mod client {
                         .expect("Infallible write of bincode body to vec failed");
                     let path_transformer;
                     {
-                        let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
+                        let mut compressor = ZlibWriteEncoder::new(&mut body, compression);
                         path_transformer = inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;
@@ -1396,9 +1461,9 @@ mod client {
                     Ok((body, path_transformer))
                 })
                 .await??;
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = self.client.load().post(url);
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
+            bincode_req_fut(req, self.deserialize_offload_threshold)
                 .map_ok(|res| (res, path_transformer))
                 .await
         }
