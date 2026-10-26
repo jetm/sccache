@@ -24,7 +24,7 @@ use std::io;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg_attr(target_os = "freebsd", path = "build_freebsd.rs")]
@@ -1216,6 +1216,8 @@ pub struct Server {
     // Jobs currently executing a build. Reported in every heartbeat so the
     // scheduler's liveness lease never reaps a compile still in flight here.
     running_jobs: Mutex<HashSet<JobId>>,
+    // One lock per toolchain being uploaded; see store_toolchain.
+    upload_locks: UploadLocks,
 }
 
 impl Server {
@@ -1231,6 +1233,7 @@ impl Server {
             cache: Mutex::new(cache),
             job_toolchains: Mutex::new(HashMap::new()),
             running_jobs: Mutex::new(HashSet::new()),
+            upload_locks: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -1247,6 +1250,60 @@ impl Drop for RunningJobGuard<'_> {
     fn drop(&mut self) {
         self.running_jobs.lock().unwrap().remove(&self.job_id);
     }
+}
+
+type UploadLocks = Mutex<HashMap<Toolchain, Arc<Mutex<()>>>>;
+
+// Receive one toolchain upload into the cache. Uploads of the same toolchain take
+// turns on a per-toolchain lock, so a second client submitting it while the first is
+// still transferring waits and then finds it cached, instead of streaming a second
+// copy to disk and grafting it a second time. Uploads of different toolchains still
+// run in parallel, and the transfer itself never holds the global cache mutex.
+fn store_toolchain(
+    cache: &Mutex<TcCache>,
+    upload_locks: &UploadLocks,
+    tc: &Toolchain,
+    tc_rdr: &mut dyn io::Read,
+) -> SubmitToolchainResult {
+    let upload_lock = build::get_toolchain_lock(upload_locks, tc);
+    let result = {
+        let _upload_guard = upload_lock.lock().unwrap();
+        receive_toolchain(cache, tc, tc_rdr)
+    };
+    build::prune_toolchain_lock(upload_locks, tc, &upload_lock);
+    result
+}
+
+fn receive_toolchain(
+    cache: &Mutex<TcCache>,
+    tc: &Toolchain,
+    tc_rdr: &mut dyn io::Read,
+) -> SubmitToolchainResult {
+    // Skip the transfer entirely if the toolchain is already cached. Grab the cache
+    // directory while we hold the lock so the temp file lands on the same
+    // filesystem and the final insert is a rename.
+    let tc_cache_dir = {
+        let cache = cache.lock().unwrap();
+        // TODO: this returns before reading all the data, is that valid?
+        if cache.contains_toolchain(tc) {
+            return SubmitToolchainResult::Success;
+        }
+        cache.path().to_path_buf()
+    };
+    let Ok(mut tmpfile) = tempfile::NamedTempFile::new_in(&tc_cache_dir) else {
+        return SubmitToolchainResult::CannotCache;
+    };
+    if io::copy(tc_rdr, tmpfile.as_file_mut()).is_err() {
+        return SubmitToolchainResult::CannotCache;
+    }
+    let temp_path = tmpfile.into_temp_path();
+    // Re-acquire the cache lock ONLY to graft the finished file into the cache.
+    cache
+        .lock()
+        .unwrap()
+        .insert_at(tc, &temp_path)
+        .map(|_| SubmitToolchainResult::Success)
+        .unwrap_or(SubmitToolchainResult::CannotCache)
 }
 
 impl ServerIncoming for Server {
@@ -1301,17 +1358,12 @@ impl ServerIncoming for Server {
             Some(tc) => tc,
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
-        let mut cache = self.cache.lock().unwrap();
-        // TODO: this returns before reading all the data, is that valid?
-        if cache.contains_toolchain(&tc) {
-            return Ok(SubmitToolchainResult::Success);
-        }
-        Ok(cache
-            .insert_with(&tc, |mut file| {
-                io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-            })
-            .map(|_| SubmitToolchainResult::Success)
-            .unwrap_or(SubmitToolchainResult::CannotCache))
+        Ok(store_toolchain(
+            &self.cache,
+            &self.upload_locks,
+            &tc,
+            &mut { tc_rdr },
+        ))
     }
     fn handle_run_job(
         &self,
@@ -2166,5 +2218,130 @@ mod scheduler_tests {
             0,
             "no Started reap must occur within the grace floor"
         );
+    }
+
+    // The upload transfer in handle_submit_toolchain streams to a temp file
+    // with the cache lock released; only the final graft reacquires the lock.
+    // Drive that graft path directly: a materialized temp file inserts under
+    // its toolchain key, and a file whose contents do not hash to the key is
+    // refused rather than served as a corrupt entry.
+    #[test]
+    fn test_submit_toolchain_no_lock_across_transfer() {
+        use sccache::util::Digest;
+        use std::io::Write;
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let mut cache = TcCache::new(cache_dir.path(), u64::MAX).unwrap();
+
+        // Materialize the upload exactly as the handler does after io::copy.
+        let mut tmpfile = tempfile::NamedTempFile::new_in(cache.path()).unwrap();
+        tmpfile.write_all(b"toolchain-bytes").unwrap();
+        tmpfile.flush().unwrap();
+        let archive_id = Digest::reader_sync(std::fs::File::open(tmpfile.path()).unwrap()).unwrap();
+        let tc = Toolchain { archive_id };
+        let temp_path = tmpfile.into_temp_path();
+
+        assert!(!cache.contains_toolchain(&tc));
+        cache.insert_at(&tc, &temp_path).unwrap();
+        assert!(cache.contains_toolchain(&tc));
+
+        // A temp file that does not hash to the requested key is refused.
+        let mut bad = tempfile::NamedTempFile::new_in(cache.path()).unwrap();
+        bad.write_all(b"not-the-right-bytes").unwrap();
+        bad.flush().unwrap();
+        let wrong_tc = Toolchain {
+            archive_id: "deadbeefcafe".to_owned(),
+        };
+        let bad_path = bad.into_temp_path();
+        assert!(cache.insert_at(&wrong_tc, &bad_path).is_err());
+    }
+
+    /// Blocks inside its first read until released, so an upload stays in flight.
+    struct GatedReader {
+        data: std::io::Cursor<Vec<u8>>,
+        started: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl io::Read for GatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.data.read(buf)
+        }
+    }
+
+    /// Counts the bytes taken from it.
+    struct CountingReader {
+        data: std::io::Cursor<Vec<u8>>,
+        read: Arc<AtomicUsize>,
+    }
+
+    impl io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.data.read(buf)?;
+            self.read.fetch_add(n, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    // Two clients submitting the same uncached toolchain used to both stream it to
+    // disk and both graft it into the cache: duplicate transfers, temp files outside
+    // the cache's size bound, and a double-counted entry. The second submit has to
+    // wait for the first and then find the toolchain cached without reading a byte.
+    #[test]
+    fn test_store_toolchain_is_single_flight_per_toolchain() {
+        use sccache::util::Digest;
+
+        let bytes = b"toolchain-bytes".to_vec();
+        let archive_id = Digest::reader_sync(io::Cursor::new(bytes.clone())).unwrap();
+        let tc = Toolchain { archive_id };
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Mutex::new(TcCache::new(cache_dir.path(), u64::MAX).unwrap());
+        let locks = Mutex::new(HashMap::new());
+        let second_read = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let mut rdr = GatedReader {
+                    data: io::Cursor::new(bytes.clone()),
+                    started: Some(started_tx),
+                    release: release_rx,
+                };
+                store_toolchain(&cache, &locks, &tc, &mut rdr)
+            });
+            started_rx.recv().unwrap();
+
+            let second = scope.spawn(|| {
+                let mut rdr = CountingReader {
+                    data: io::Cursor::new(bytes.clone()),
+                    read: second_read.clone(),
+                };
+                store_toolchain(&cache, &locks, &tc, &mut rdr)
+            });
+            // The first upload is still in flight; give the second time to start
+            // transferring if nothing stops it. Release the first before asserting,
+            // so a failure here fails the test instead of leaving the scope hung.
+            std::thread::sleep(Duration::from_millis(300));
+            let read_while_first_in_flight = second_read.load(Ordering::SeqCst);
+            release_tx.send(()).unwrap();
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+
+            assert_eq!(
+                0, read_while_first_in_flight,
+                "the second submit of the same toolchain must wait for the first"
+            );
+            assert!(matches!(first, SubmitToolchainResult::Success));
+            assert!(matches!(second, SubmitToolchainResult::Success));
+        });
+
+        assert_eq!(0, second_read.load(Ordering::SeqCst));
+        assert!(cache.lock().unwrap().contains_toolchain(&tc));
+        assert!(locks.lock().unwrap().is_empty());
     }
 }
