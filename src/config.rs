@@ -1674,6 +1674,15 @@ pub mod server {
         // count reserves them. None = use the detected hardware count.
         #[serde(default)]
         pub num_cpus: Option<usize>,
+        // When this build server shares a host with the scheduler (the colocated
+        // orchestrator node that also runs the client's preprocessing and
+        // bitbake), reserve this fraction of its cores instead of advertising
+        // them all - computed from the node's own hardware so the same config is
+        // portable across cluster topologies. Defaults to 0.35 when unset;
+        // ignored on a pure remote server. An explicit `num_cpus` above overrides
+        // this with an absolute count.
+        #[serde(default)]
+        pub colocated_reserve_fraction: Option<f64>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3117,8 +3126,9 @@ fn server_toml_parse() {
             },
             toolchain_cache_size: 10737418240,
             num_cpus: None,
+            colocated_reserve_fraction: None,
         }
-    )
+    );
 }
 
 #[test]

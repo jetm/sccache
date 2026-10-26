@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::env;
 use std::io;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -242,6 +243,7 @@ fn run(command: Command) -> Result<i32> {
             scheduler_auth,
             toolchain_cache_size,
             num_cpus: advertised_num_cpus,
+            colocated_reserve_fraction,
         }) => {
             let builder: Box<dyn dist::BuilderIncoming> = match builder {
                 #[cfg(not(target_os = "freebsd"))]
@@ -301,7 +303,13 @@ fn run(command: Command) -> Result<i32> {
 
             let server = Server::new(builder, &cache_dir, toolchain_cache_size)
                 .context("Failed to create sccache server instance")?;
-            let advertised_num_cpus = advertised_num_cpus.unwrap_or_else(num_cpus);
+            let colocated = is_colocated(&scheduler_url.to_url(), public_addr.ip());
+            let advertised_num_cpus = advertised_cores(
+                advertised_num_cpus,
+                num_cpus(),
+                colocated,
+                colocated_reserve_fraction,
+            );
             let http_server = dist::http::Server::new(
                 public_addr,
                 bind_address,
@@ -467,6 +475,131 @@ fn load_weight(job_count: usize, core_count: usize) -> f64 {
         MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
     } else {
         job_count as f64 / core_count as f64
+    }
+}
+
+/// Default fraction of its cores a colocated build server holds back from the
+/// scheduler, reserving them for the local client's preprocessing and bitbake.
+const DEFAULT_COLOCATED_RESERVE_FRACTION: f64 = 0.35;
+
+/// Resolve the core count a build server advertises to the scheduler. An
+/// explicit `num_cpus` wins; otherwise a server colocated with the scheduler
+/// reserves `reserve_fraction` of its hardware (default
+/// [`DEFAULT_COLOCATED_RESERVE_FRACTION`]) so the load model routes
+/// proportionally more to the pure-remote nodes, while a remote server
+/// advertises all its cores. Computed from the node's own `hw`, so the same
+/// binary and config are portable across cluster topologies.
+fn advertised_cores(
+    explicit: Option<usize>,
+    hw: usize,
+    colocated: bool,
+    reserve_fraction: Option<f64>,
+) -> usize {
+    // 0 cores is not a count the scheduler accepts, and NaN would clamp to NaN and
+    // round to a single core, so both fall back to the computed value.
+    if let Some(n) = explicit.filter(|&n| n > 0) {
+        return n;
+    }
+    if colocated {
+        let fraction = reserve_fraction
+            .filter(|f| f.is_finite())
+            .unwrap_or(DEFAULT_COLOCATED_RESERVE_FRACTION)
+            .clamp(0.0, 0.9);
+        std::cmp::max(1, (hw as f64 * (1.0 - fraction)).round() as usize)
+    } else {
+        hw
+    }
+}
+
+/// Whether the scheduler runs on the machine this build server is on. The scheduler
+/// URL may name the host by address, by IPv6 literal (`host_str` keeps the brackets),
+/// by loopback or by DNS name, and comparing it to the server's public address as a
+/// string only ever matched the plain-IPv4 spelling.
+fn is_colocated(scheduler_url: &reqwest::Url, public_ip: IpAddr) -> bool {
+    let Some(host) = scheduler_url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let resolved: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => (host, scheduler_url.port_or_known_default().unwrap_or(0))
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+            .unwrap_or_default(),
+    };
+    resolved
+        .iter()
+        .any(|ip| ip.is_loopback() || *ip == public_ip)
+}
+
+#[cfg(test)]
+mod advertised_cores_tests {
+    use super::{advertised_cores, is_colocated};
+    use std::net::IpAddr;
+
+    fn url(s: &str) -> reqwest::Url {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_scheduler_at_the_servers_own_ipv4_address_is_colocated() {
+        let ip: IpAddr = "10.42.0.1".parse().unwrap();
+        assert!(is_colocated(&url("http://10.42.0.1:10600"), ip));
+    }
+
+    #[test]
+    fn a_scheduler_at_another_address_is_not_colocated() {
+        let ip: IpAddr = "10.42.0.2".parse().unwrap();
+        assert!(!is_colocated(&url("http://10.42.0.1:10600"), ip));
+    }
+
+    #[test]
+    fn a_loopback_scheduler_is_colocated_whatever_the_public_address() {
+        let ip: IpAddr = "10.42.0.2".parse().unwrap();
+        assert!(is_colocated(&url("http://127.0.0.1:10600"), ip));
+        assert!(is_colocated(&url("http://[::1]:10600"), ip));
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_scheduler_matches_the_servers_ipv6_address() {
+        let ip: IpAddr = "fd00::1".parse().unwrap();
+        assert!(is_colocated(&url("http://[fd00::1]:10600"), ip));
+        assert!(!is_colocated(&url("http://[fd00::2]:10600"), ip));
+    }
+
+    #[test]
+    fn reserves_the_default_fraction_when_colocated() {
+        // 32 cores, colocated, default 0.35 -> round(32 * 0.65) = 21.
+        assert_eq!(advertised_cores(None, 32, true, None), 21);
+    }
+
+    #[test]
+    fn a_remote_server_advertises_all_cores() {
+        assert_eq!(advertised_cores(None, 32, false, None), 32);
+    }
+
+    #[test]
+    fn an_explicit_count_overrides_the_fraction() {
+        assert_eq!(advertised_cores(Some(16), 32, true, None), 16);
+    }
+
+    // The scheduler rejects a heartbeat advertising 0 cores, so a configured 0 would
+    // leave the server unable to register at all.
+    #[test]
+    fn an_explicit_zero_falls_back_to_the_computed_count() {
+        assert_eq!(advertised_cores(Some(0), 32, false, None), 32);
+        assert_eq!(advertised_cores(Some(0), 32, true, None), 21);
+    }
+
+    #[test]
+    fn a_non_finite_fraction_falls_back_to_the_default() {
+        assert_eq!(advertised_cores(None, 32, true, Some(f64::NAN)), 21);
+        assert_eq!(advertised_cores(None, 32, true, Some(f64::INFINITY)), 21);
+    }
+
+    #[test]
+    fn a_custom_fraction_is_honoured() {
+        assert_eq!(advertised_cores(None, 32, true, Some(0.5)), 16);
     }
 }
 
@@ -821,7 +954,7 @@ impl SchedulerIncoming for Scheduler {
             let mut server_details = servers.get_mut(&server_id);
             if let Some(ref mut details) = server_details {
                 details.last_seen = now;
-            };
+            }
 
             match (job_detail.state, job_state) {
                 (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
@@ -829,14 +962,14 @@ impl SchedulerIncoming for Scheduler {
                     if let Some(details) = server_details {
                         details.jobs_unclaimed.remove(&job_id);
                     } else {
-                        warn!("Job state updated, but server is not known to scheduler")
+                        warn!("Job state updated, but server is not known to scheduler");
                     }
-                    entry.get_mut().state = job_state
+                    entry.get_mut().state = job_state;
                 }
                 (JobState::Started, JobState::Complete) => {
                     let (job_id, _) = entry.remove_entry();
                     if let Some(entry) = server_details {
-                        assert!(entry.jobs_assigned.remove(&job_id))
+                        assert!(entry.jobs_assigned.remove(&job_id));
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
                     }

@@ -232,6 +232,7 @@ fn sccache_server_cfg(
         },
         toolchain_cache_size: TC_CACHE_SIZE,
         num_cpus: None,
+        colocated_reserve_fraction: None,
     }
 }
 
@@ -476,8 +477,11 @@ impl DistSystem {
                     env::set_var("SCCACHE_LOG", "sccache=trace");
                 }
                 env_logger::try_init().unwrap();
-                server.start().unwrap();
-                unreachable!();
+                // start() returns Result<Infallible>, so it can only resolve to an
+                // error; surface it as a panic so the arm diverges cleanly without
+                // an unreachable expression for clippy to flag.
+                let err = server.start().unwrap_err();
+                panic!("dist build server exited: {err}");
             }
         };
 
@@ -502,7 +506,7 @@ impl DistSystem {
                 panic!("restart not yet implemented for pids")
             }
         }
-        self.wait_server_ready(handle)
+        self.wait_server_ready(handle);
     }
     pub fn count_toolchains_on_server(&mut self, handle: &ServerHandle) -> usize {
         match handle {
@@ -646,7 +650,7 @@ impl Drop for DistSystem {
                 nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)).map(|ws| {
                     if ws != WaitStatus::StillAlive {
                         killagain = false;
-                        exits.push(ws)
+                        exits.push(ws);
                     }
                 })
             );
@@ -701,7 +705,7 @@ impl Drop for DistSystem {
             );
         }
         for exit in exits {
-            println!("EXIT: {:?}", exit)
+            println!("EXIT: {:?}", exit);
         }
 
         if did_err && !thread::panicking() {
@@ -745,7 +749,7 @@ fn wait_for_http(url: HTTPUrl, interval: Duration, max_wait: Duration) {
         },
         interval,
         max_wait,
-    )
+    );
 }
 
 fn wait_for<F: Fn() -> Result<(), String>>(f: F, interval: Duration, max_wait: Duration) {
