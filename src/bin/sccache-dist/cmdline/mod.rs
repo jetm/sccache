@@ -23,7 +23,7 @@ pub use parse::try_parse_from;
 pub enum Command {
     Auth(AuthSubcommand),
     Scheduler(config::scheduler::Config),
-    Server(config::server::Config),
+    Server(Box<config::server::Config>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
