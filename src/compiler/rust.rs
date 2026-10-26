@@ -2706,7 +2706,8 @@ impl pkg::InputsPackager for RustInputsPackager {
                     };
                     // Without rustc dependency names, a hashless native library such as
                     // libz.so is indistinguishable from a hashless Rust artifact.
-                    if hashless && rlib_dep_reader_and_names.is_none() {
+                    // A target rustlib dir is exempt: its hashless libstd.rlib is a Rust crate.
+                    if hashless && !ship_all && rlib_dep_reader_and_names.is_none() {
                         continue;
                     }
                     if let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names {
@@ -4960,6 +4961,69 @@ foo.rs:
             ArgData::Target(ArgTarget::Name("x86_64-unknown-linux-gnu".to_owned())),
             ArgDisposition::Separated
         )));
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn shipped_lib_names(libdir: &Path) -> Vec<String> {
+        let packager = Box::new(RustInputsPackager {
+            env_vars: vec![],
+            crate_link_paths: vec![libdir.to_path_buf()],
+            crate_types: CrateTypes {
+                rlib: false,
+                staticlib: false,
+            },
+            inputs: vec![],
+            path_transformer: dist::PathTransformer::new(),
+            rlib_dep_reader: None,
+        });
+        let mut buf = vec![];
+        pkg::InputsPackager::write_inputs(packager, &mut buf).unwrap();
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let path = e.path().unwrap();
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    // With no rustc dependency names (a non-cargo build) a target sysroot still has
+    // to ship its hashless libstd.rlib, or every std-dependent crate fails remotely.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_inputs_packager_ships_hashless_sysroot_rlib_without_dep_names() {
+        let td = tempfile::Builder::new()
+            .prefix("sccache_test_rustlib")
+            .tempdir()
+            .unwrap();
+        let libdir = td.path().join("rustlib/aarch64-linux-gnu/lib");
+        fs::create_dir_all(&libdir).unwrap();
+        fs::write(libdir.join("libstd.rlib"), b"std").unwrap();
+        fs::write(libdir.join("libcore-0123456789abcdef.rlib"), b"core").unwrap();
+        assert_eq!(
+            vec!["libcore-0123456789abcdef.rlib", "libstd.rlib"],
+            shipped_lib_names(&libdir)
+        );
+    }
+
+    // Outside a target rustlib dir a hashless library is a native library such as
+    // libz.so and must stay out of the inputs when no dependency names are known.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_inputs_packager_skips_hashless_native_lib_outside_rustlib() {
+        let td = tempfile::Builder::new()
+            .prefix("sccache_test_nativelib")
+            .tempdir()
+            .unwrap();
+        let libdir = td.path().join("usr/lib");
+        fs::create_dir_all(&libdir).unwrap();
+        fs::write(libdir.join("libz.so"), b"z").unwrap();
+        assert!(shipped_lib_names(&libdir).is_empty());
     }
 
     #[cfg(feature = "dist-client")]
