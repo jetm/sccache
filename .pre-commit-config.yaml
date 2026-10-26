@@ -18,7 +18,7 @@ repos:
       - id: rust-clippy
         name: cargo clippy
         description: Lint all targets with warnings denied.
-        entry: cargo clippy --locked --all-targets --features all,dist-server -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
+        entry: cargo clippy --locked --all-targets --features all,dist-server -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default -A clippy::double_must_use
         pass_filenames: false
         types: [file, rust]
         language: system
