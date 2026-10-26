@@ -367,7 +367,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 0,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _
                     }
                 ) {
                     Ok(())
@@ -541,7 +542,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 1,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _
                     }
                 ) {
                     Ok(())
