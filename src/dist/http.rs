@@ -1022,7 +1022,9 @@ mod server {
                     // so keep-alive connections are reused, not rebuilt.
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(Duration::from_secs(90))
-                    .timeout(Duration::from_secs(5))
+                    // Bounds connect + request: a stop must not hang on a
+                    // scheduler that is down, systemd's stop timeout is longer.
+                    .timeout(Duration::from_secs(2))
                     .build()
                     .expect("deregister http client must build");
                 loop {
@@ -1041,7 +1043,7 @@ mod server {
                         }
                         std::process::exit(0);
                     }
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(Duration::from_millis(20));
                 }
             });
 
