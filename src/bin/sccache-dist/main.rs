@@ -332,6 +332,21 @@ fn init_logging() {
 // Maximum number of jobs per core - only occurs for one core, usually less, see load_weight()
 const MAX_PER_CORE_LOAD: f64 = 2f64;
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
+// A server that just failed a job assignment is demoted so the scheduler
+// prefers a healthy one. The demotion must not be absolute, though: a
+// network-remote server takes transient assignment errors that a
+// scheduler-colocated server never does, so a hard demotion strands the remote
+// node's idle capacity while jobs pile onto a busy local one (measured: 1710
+// idle-server skips in one build, all on the remote node). Treat a recent error
+// as this much extra load instead, so a recently-errored server still wins when
+// it is more than this margin less loaded than the healthy alternative - a
+// repeat failure only costs one wasted round-trip and a local fallback.
+const RECENT_ERROR_LOAD_PENALTY: f64 = 0.125;
+// A failed assignment leaves the server idle, so the penalty alone keeps it the
+// least-loaded candidate and a dead node would absorb every allocation. A
+// recently-errored server is therefore only preferred over a healthy one once
+// this long has passed since its last failure; each new failure restarts the wait.
+const RECENT_ERROR_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -462,6 +477,8 @@ impl SchedulerIncoming for Scheduler {
                 let mut best = None;
                 let mut best_err = None;
                 let mut best_load: f64 = MAX_PER_CORE_LOAD;
+                let mut best_err_load: f64 = MAX_PER_CORE_LOAD;
+                let mut best_err_probe_due = false;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
                     // A server silent past the heartbeat timeout is dead but
@@ -494,6 +511,9 @@ impl SchedulerIncoming for Scheduler {
                                             now - last_error
                                         );
                                         best_err = Some((server_id, details));
+                                        best_err_load = load;
+                                        best_err_probe_due = now.duration_since(last_error)
+                                            >= RECENT_ERROR_PROBE_INTERVAL;
                                     }
                                 }
                                 _ => {
@@ -503,6 +523,9 @@ impl SchedulerIncoming for Scheduler {
                                         now - last_error
                                     );
                                     best_err = Some((server_id, details));
+                                    best_err_load = load;
+                                    best_err_probe_due = now.duration_since(last_error)
+                                        >= RECENT_ERROR_PROBE_INTERVAL;
                                 }
                             }
                         }
@@ -516,8 +539,27 @@ impl SchedulerIncoming for Scheduler {
                     }
                 }
 
-                // Assign the job to our best choice
-                if let Some((server_id, server_details)) = best.or(best_err) {
+                // Assign the job to our best choice. Prefer the least-loaded
+                // healthy server, but fall to a recently-errored one when it is
+                // more than RECENT_ERROR_LOAD_PENALTY less loaded - so a remote
+                // node briefly demoted by a transient error is not stranded idle
+                // while a busy healthy node absorbs the work. best_load /
+                // best_err_load stay MAX_PER_CORE_LOAD while their bucket is
+                // empty, so the comparison naturally keeps the populated one.
+                let choice = match (best, best_err) {
+                    (Some(clean), Some(errored)) => {
+                        if best_err_probe_due
+                            && best_err_load + RECENT_ERROR_LOAD_PENALTY < best_load
+                        {
+                            Some(errored)
+                        } else {
+                            Some(clean)
+                        }
+                    }
+                    (Some(clean), None) => Some(clean),
+                    (None, errored) => errored,
+                };
+                if let Some((server_id, server_details)) = choice {
                     let job_id = self.next_job_id();
                     assert!(server_details.jobs_assigned.insert(job_id));
                     assert!(
@@ -1078,6 +1120,78 @@ mod scheduler_tests {
         }
     }
 
+    /// Fails every assignment to one address and records which addresses were tried.
+    struct FailAssignTo {
+        dead: &'static str,
+        tried: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SchedulerOutgoing for FailAssignTo {
+        fn do_assign_job(
+            &self,
+            server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            let addr = server_id.addr().to_string();
+            self.tried.lock().unwrap().push(addr.clone());
+            if addr == self.dead {
+                bail!("connection refused");
+            }
+            Ok(AssignJobResult {
+                state: JobState::Ready,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    fn dead_picks(scheduler: &Scheduler, dead: &'static str, allocs: usize) -> usize {
+        let requester = FailAssignTo {
+            dead,
+            tried: Default::default(),
+        };
+        for _ in 0..allocs {
+            let _ = scheduler.handle_alloc_job(&requester, a_toolchain());
+        }
+        let tried = requester.tried.lock().unwrap();
+        tried.iter().filter(|a| a.as_str() == dead).count()
+    }
+
+    // A server that just refused an assignment stays idle, so with a flat error
+    // penalty it looks the least loaded on every allocation and absorbs each one
+    // while a healthy busy node waits. Right after a failure it must be skipped.
+    #[test]
+    fn test_alloc_job_skips_a_server_that_just_failed_an_assignment() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.1:10501", 5, None);
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, Some(Instant::now()));
+
+        assert_eq!(0, dead_picks(&scheduler, "10.42.0.2:10501", 20));
+    }
+
+    // The skip is a probe interval, not a ban: a transiently failed node is tried
+    // again once the interval has passed, and its next failure restarts the wait.
+    #[test]
+    fn test_alloc_job_probes_a_failed_server_once_per_interval() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.1:10501", 5, None);
+        let past_interval = Instant::now() - (RECENT_ERROR_PROBE_INTERVAL + Duration::from_secs(1));
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, Some(past_interval));
+
+        assert_eq!(1, dead_picks(&scheduler, "10.42.0.2:10501", 20));
+    }
+
+    // With no healthy alternative the failed server is still used, so a one-node
+    // cluster is not stranded by a transient error.
+    #[test]
+    fn test_alloc_job_still_uses_a_failed_server_when_it_is_the_only_one() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, Some(Instant::now()));
+
+        assert_eq!(3, dead_picks(&scheduler, "10.42.0.2:10501", 3));
+    }
+
     // A server silent past HEARTBEAT_TIMEOUT is dead but is only removed by
     // prune_servers, which runs on the heartbeat and status paths - not on
     // alloc_job. Until then it must never receive a job, or the scheduler
@@ -1134,5 +1248,84 @@ mod scheduler_tests {
             status.num_servers, 0,
             "a deregistered server must be gone immediately"
         );
+    }
+
+    // Insert a live server carrying `num_jobs` assigned jobs and an optional
+    // recent error. Job ids start high so they never collide with the ids the
+    // scheduler mints from job_count (which starts at 0) during the alloc.
+    fn insert_busy_server(
+        scheduler: &Scheduler,
+        addr: &str,
+        num_jobs: usize,
+        last_error: Option<Instant>,
+    ) {
+        let server_id = ServerId::new(addr.parse::<SocketAddr>().unwrap());
+        let mut jobs_assigned = HashSet::new();
+        for i in 0..num_jobs {
+            jobs_assigned.insert(JobId(1000 + i as u64));
+        }
+        let mut servers = scheduler.servers.lock().unwrap();
+        servers.insert(
+            server_id,
+            ServerDetails {
+                last_seen: Instant::now(),
+                last_error,
+                jobs_assigned,
+                jobs_unclaimed: HashMap::new(),
+                num_cpus: 32,
+                server_nonce: ServerNonce::new(),
+                job_authorizer: Box::new(TestJobAuthorizer),
+            },
+        );
+    }
+
+    // A recently-errored but idle server must still win over a healthy but
+    // heavily-loaded one. A network-remote node takes transient assignment
+    // errors a colocated node never does; stranding its idle capacity while a
+    // busy node absorbs the work was the dominant misroute (measured 1710x, all
+    // on the remote node). Here the 12/32-vs-0 load gap clears the error
+    // penalty, so the idle errored node wins.
+    #[test]
+    fn test_alloc_job_prefers_idle_errored_server_over_loaded_healthy_server() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.1:10501", 12, None);
+        let probe_due = Instant::now() - (RECENT_ERROR_PROBE_INTERVAL + Duration::from_secs(1));
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, Some(probe_due));
+
+        let res = scheduler
+            .handle_alloc_job(&AssignOk, a_toolchain())
+            .expect("handle_alloc_job should not error");
+
+        match res {
+            AllocJobResult::Success { job_alloc, .. } => assert_eq!(
+                job_alloc.server_id.addr().to_string(),
+                "10.42.0.2:10501",
+                "the idle recently-errored server must win over the loaded healthy one"
+            ),
+            _ => panic!("expected a successful allocation"),
+        }
+    }
+
+    // The error demotion is not abandoned: when the healthy server is only
+    // marginally busier (within the penalty), the recently-errored server stays
+    // demoted, so a flaky node is not chosen for a negligible capacity gain.
+    #[test]
+    fn test_alloc_job_keeps_healthy_server_when_error_penalty_outweighs_gap() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.1:10501", 2, None);
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, Some(Instant::now()));
+
+        let res = scheduler
+            .handle_alloc_job(&AssignOk, a_toolchain())
+            .expect("handle_alloc_job should not error");
+
+        match res {
+            AllocJobResult::Success { job_alloc, .. } => assert_eq!(
+                job_alloc.server_id.addr().to_string(),
+                "10.42.0.1:10501",
+                "a marginally-busier healthy server must be kept over a flaky one"
+            ),
+            _ => panic!("expected a successful allocation"),
+        }
     }
 }
