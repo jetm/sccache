@@ -2288,6 +2288,110 @@ mod scheduler_tests {
         assert!(cache.insert_at(&wrong_tc, &bad_path).is_err());
     }
 
+    fn nonce_of(scheduler: &Scheduler, server_id: ServerId) -> ServerNonce {
+        scheduler
+            .servers
+            .lock()
+            .unwrap()
+            .get(&server_id)
+            .unwrap()
+            .server_nonce
+            .clone()
+    }
+
+    // The fixed-timeout backstop must not reap a job the server still names in its
+    // heartbeats, however old: a genuinely slow compile has to survive. Dropping the
+    // "reported active" guard would reap every long compile at the timeout.
+    #[test]
+    fn test_backstop_keeps_a_started_job_the_server_still_reports_active() {
+        let scheduler = Scheduler::new();
+        let server_id = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let job_id = JobId(1000);
+        insert_started_job(
+            &scheduler,
+            server_id,
+            job_id,
+            STARTED_COMPLETE_TIMEOUT + Duration::from_secs(10),
+        );
+        let nonce = nonce_of(&scheduler, server_id);
+
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                32,
+                Box::new(TestJobAuthorizer),
+                vec![job_id],
+            )
+            .unwrap();
+
+        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        assert!(
+            scheduler
+                .servers
+                .lock()
+                .unwrap()
+                .get(&server_id)
+                .unwrap()
+                .jobs_assigned
+                .contains(&job_id)
+        );
+        assert_eq!(0, scheduler.jobs_reaped_started.load(Ordering::Relaxed));
+    }
+
+    // A graceful deregister must drop the departing server's jobs from the
+    // scheduler, or they count as in progress forever.
+    #[test]
+    fn test_deregister_drops_the_servers_jobs_and_counts_them() {
+        let scheduler = Scheduler::new();
+        let server_id = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let job_id = JobId(1000);
+        insert_started_job(&scheduler, server_id, job_id, Duration::from_secs(1));
+
+        let res = scheduler.handle_deregister_server(server_id).unwrap();
+
+        assert!(res.success);
+        assert!(scheduler.servers.lock().unwrap().is_empty());
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+        assert_eq!(1, scheduler.jobs_pruned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_deregister_of_an_unknown_server_is_a_successful_no_op() {
+        let scheduler = Scheduler::new();
+        let known = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        insert_started_job(&scheduler, known, JobId(1000), Duration::from_secs(1));
+        let unknown = ServerId::new("10.42.0.9:10501".parse::<SocketAddr>().unwrap());
+
+        let res = scheduler.handle_deregister_server(unknown).unwrap();
+
+        assert!(res.success);
+        assert_eq!(1, scheduler.servers.lock().unwrap().len());
+        assert_eq!(1, scheduler.jobs.lock().unwrap().len());
+        assert_eq!(0, scheduler.jobs_pruned.load(Ordering::Relaxed));
+    }
+
+    // The status response carries one entry per server with its own core count and
+    // assigned-job count, alongside the aggregates.
+    #[test]
+    fn test_status_reports_each_server_with_its_load() {
+        let scheduler = Scheduler::new();
+        insert_busy_server(&scheduler, "10.42.0.1:10501", 3, None);
+        insert_busy_server(&scheduler, "10.42.0.2:10501", 0, None);
+
+        let status = scheduler.handle_status().unwrap();
+
+        assert_eq!(2, status.num_servers);
+        assert_eq!(64, status.num_cpus);
+        let mut servers = status.servers.clone();
+        servers.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!("10.42.0.1:10501", servers[0].id);
+        assert_eq!(32, servers[0].num_cpus);
+        assert_eq!(3, servers[0].in_progress);
+        assert_eq!("10.42.0.2:10501", servers[1].id);
+        assert_eq!(0, servers[1].in_progress);
+    }
+
     /// Blocks inside its first read until released, so an upload stays in flight.
     struct GatedReader {
         data: std::io::Cursor<Vec<u8>>,
