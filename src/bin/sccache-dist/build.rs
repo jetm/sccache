@@ -356,7 +356,16 @@ impl OverlayBuilder {
                 }
             }
         }
-        for victim in evictions {
+        self.evict_toolchains(evictions)?;
+
+        self.make_overlay_spec(tc, entry)
+    }
+
+    // Delete the unpacked directory of each victim that is neither being prepared nor
+    // back in the map. Called with this request's own prepare lock held, which is why
+    // the per-victim locks below are only ever try-locked.
+    fn evict_toolchains(&self, victims: Vec<Toolchain>) -> Result<()> {
+        for victim in victims {
             // Delete each victim under its own preparation lock so a concurrent
             // request that legitimately re-prepares the same toolchain cannot
             // create_dir+untar into the path we are deleting. Use try_lock, never
@@ -393,8 +402,7 @@ impl OverlayBuilder {
             // without bound as toolchains churn.
             prune_toolchain_lock(&self.toolchain_prepare_locks, &victim, &victim_lock);
         }
-
-        self.make_overlay_spec(tc, entry)
+        Ok(())
     }
 
     // Bump and return a clone of the prepared-toolchain entry when it is both
@@ -1177,30 +1185,113 @@ mod tests {
         drop(guard);
     }
 
-    // The eviction path in prepare_overlay_dirs deletes a victim only after a
-    // try_lock on the victim's preparation lock succeeds. Constructing an
-    // OverlayBuilder requires root, so drive the try_lock invariant the eviction
-    // loop relies on directly: while a victim is being prepared (its lock held),
-    // try_lock must fail so the victim is skipped; once released, try_lock must
-    // succeed so the stale directory can be removed.
+    // An OverlayBuilder whose toolchains directory holds one unpacked directory per
+    // id, built without root because eviction never touches bubblewrap.
+    fn builder_with_toolchain_dirs(root: &Path, ids: &[&str]) -> OverlayBuilder {
+        let dir = root.join("build");
+        for id in ids {
+            fs::create_dir_all(dir.join("toolchains").join(id)).unwrap();
+        }
+        OverlayBuilder {
+            bubblewrap: PathBuf::new(),
+            dir,
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+            toolchain_prepare_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn toolchain_dir_exists(builder: &OverlayBuilder, id: &str) -> bool {
+        builder.dir.join("toolchains").join(id).exists()
+    }
+
+    // Eviction deletes an idle victim's directory and drops its now-unused lock entry,
+    // so the lock map does not grow as toolchains churn.
     #[test]
-    fn test_eviction_skips_victim_while_being_prepared() {
-        let locks = Mutex::new(HashMap::new());
+    fn test_evict_toolchains_removes_an_idle_victim_and_its_lock() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &["cccc", "keep"]);
         let victim = tc("cccc");
 
-        let prepare_lock = get_toolchain_lock(&locks, &victim);
+        builder.evict_toolchains(vec![victim.clone()]).unwrap();
+
+        assert!(!toolchain_dir_exists(&builder, "cccc"));
+        assert!(
+            toolchain_dir_exists(&builder, "keep"),
+            "only the named victim is deleted"
+        );
+        assert!(
+            !builder
+                .toolchain_prepare_locks
+                .lock()
+                .unwrap()
+                .contains_key(&victim),
+            "the evicted toolchain's lock entry must be pruned"
+        );
+    }
+
+    // A victim whose preparation lock is held is being prepared by a racer. Deleting
+    // its directory would pull it out from under the untar, so eviction skips it.
+    #[test]
+    fn test_evict_toolchains_skips_a_victim_being_prepared() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_busy")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &["cccc"]);
+        let victim = tc("cccc");
+        let prepare_lock = get_toolchain_lock(&builder.toolchain_prepare_locks, &victim);
         let held = prepare_lock.lock().unwrap();
 
-        let eviction_view = get_toolchain_lock(&locks, &victim);
+        builder.evict_toolchains(vec![victim.clone()]).unwrap();
+
         assert!(
-            eviction_view.try_lock().is_err(),
-            "a victim under active preparation must not be evicted"
+            toolchain_dir_exists(&builder, "cccc"),
+            "a victim under active preparation must not be deleted"
+        );
+        drop(held);
+        drop(prepare_lock);
+        builder.evict_toolchains(vec![victim.clone()]).unwrap();
+        assert!(
+            !toolchain_dir_exists(&builder, "cccc"),
+            "once preparation finishes the victim is free to evict"
+        );
+        assert!(
+            !builder
+                .toolchain_prepare_locks
+                .lock()
+                .unwrap()
+                .contains_key(&victim),
+            "the lock entry goes with the directory once nobody else holds it"
+        );
+    }
+
+    // A racer may re-prepare the victim between the victim being picked and its
+    // lock being taken. A toolchain back in the map is live again and must stay.
+    #[test]
+    fn test_evict_toolchains_skips_a_victim_that_was_re_prepared() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_back")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &["cccc"]);
+        let victim = tc("cccc");
+        builder.toolchain_dir_map.lock().unwrap().insert(
+            victim.clone(),
+            DeflatedToolchain {
+                path: builder.dir.join("toolchains").join("cccc"),
+                build_count: 1,
+                ctime: Instant::now(),
+            },
         );
 
-        drop(held);
+        builder.evict_toolchains(vec![victim]).unwrap();
+
         assert!(
-            eviction_view.try_lock().is_ok(),
-            "once preparation finishes the victim is free to evict"
+            toolchain_dir_exists(&builder, "cccc"),
+            "a victim that is in the map again must not be deleted"
         );
     }
 
