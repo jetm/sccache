@@ -1462,6 +1462,56 @@ fn resolve_prog_in_path(raw: PathBuf, path_env: Option<&OsStr>) -> Option<PathBu
     }
 }
 
+/// Ask the compiler where one of its own files or programs lives, via
+/// `-print-file-name=<name>` or `-print-prog-name=<name>` (`kind` is `file` or
+/// `prog`). The compiler runs with the compile task's environment, because
+/// variables such as COMPILER_PATH and GCC_EXEC_PREFIX change the answer. A bare
+/// answer is resolved against `path_env`, the task's PATH, or against the daemon's own
+/// PATH when `path_env` is `None`. Returns `None` when the compiler cannot run, exits
+/// non-zero, or names a program that is not on the PATH it is resolved against.
+#[cfg(feature = "dist-client")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn print_named_path(
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    path_env: Option<&OsStr>,
+    kind: &str,
+    name: &str,
+) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut output = process::Command::new(executable)
+        .arg(format!("-print-{}-name={}", kind, name))
+        .envs(env_vars.iter().cloned())
+        .output()
+        .ok()?;
+    debug!(
+        "find named {} {} output:\n{}\n===\n{}",
+        kind,
+        name,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    if !output.status.success() {
+        debug!("exit failure");
+        return None;
+    }
+
+    // Remove the trailing newline (if present)
+    if output.stdout.last() == Some(&b'\n') {
+        output.stdout.pop();
+    }
+
+    // Create our PathBuf from the raw bytes.  Relative paths are resolved against
+    // the compile task's PATH, falling back to the daemon's PATH when none was
+    // captured.
+    let path: PathBuf = OsString::from_vec(output.stdout).into();
+    resolve_prog_in_path(path, path_env)
+}
+
 #[cfg(feature = "dist-client")]
 #[allow(unused)]
 struct CToolchainPackager {
@@ -1477,8 +1527,6 @@ struct CToolchainPackager {
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        use std::os::unix::ffi::OsStringExt;
-
         info!("Generating toolchain {}", self.executable.display());
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         package_builder.add_common()?;
@@ -1493,36 +1541,14 @@ impl pkg::ToolchainPackager for CToolchainPackager {
             .find(|(k, _)| k == OsStr::new("PATH"))
             .map(|(_, v)| v.clone());
 
-        // Helper to use -print-file-name and -print-prog-name to look up
-        // files by path.
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
-            let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{}-name={}", kind, name))
-                .envs(self.env_vars.iter().cloned())
-                .output()
-                .ok()?;
-            debug!(
-                "find named {} {} output:\n{}\n===\n{}",
+            print_named_path(
+                &self.executable,
+                &self.env_vars,
+                path_env.as_deref(),
                 kind,
                 name,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            if !output.status.success() {
-                debug!("exit failure");
-                return None;
-            }
-
-            // Remove the trailing newline (if present)
-            if output.stdout.last() == Some(&b'\n') {
-                output.stdout.pop();
-            }
-
-            // Create our PathBuf from the raw bytes.  Relative paths are
-            // resolved against the compile task's PATH, falling back to the
-            // daemon's PATH when none was captured.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
-            resolve_prog_in_path(path, path_env.as_deref())
+            )
         };
 
         // Helper to add a named file/program by to the package.
@@ -1796,6 +1822,85 @@ mod test {
         // An absolute path passes through untouched.
         let absolute = resolve_prog_in_path(prog.clone(), Some(path_env.as_os_str()));
         assert_eq!(absolute, Some(prog));
+    }
+
+    // The toolchain packager asks the compiler where its own sub-tools live, and the
+    // answer depends on variables such as COMPILER_PATH and GCC_EXEC_PREFIX. Those
+    // come from the compile task, not from the daemon, so they must reach the
+    // compiler process: a compiler that reports the host's `as` instead of the
+    // recipe's would package the wrong assembler.
+    #[test]
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_print_named_path_runs_the_compiler_with_the_task_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_named")
+            .tempdir()
+            .unwrap();
+        // Answers -print-prog-name=<name> with <SCCACHE_FAKE_TOOLDIR>/<name>.
+        let compiler = dir.path().join("fake-cc");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\necho \"${SCCACHE_FAKE_TOOLDIR}/${1#-print-prog-name=}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let task_env = vec![(
+            OsString::from("SCCACHE_FAKE_TOOLDIR"),
+            dir.path().as_os_str().to_owned(),
+        )];
+        assert_eq!(
+            print_named_path(&compiler, &task_env, None, "prog", "as"),
+            Some(dir.path().join("as")),
+            "the compile task's environment must reach the compiler"
+        );
+
+        // With no task environment the same compiler answers differently, so the
+        // assertion above cannot be satisfied by the daemon's own environment.
+        assert_eq!(
+            print_named_path(&compiler, &[], None, "prog", "as"),
+            Some(PathBuf::from("/as"))
+        );
+    }
+
+    // A compiler that exits non-zero has nothing to report, and the packager
+    // skips that sub-tool rather than failing the whole toolchain.
+    #[test]
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_print_named_path_is_none_when_the_compiler_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_named_fail")
+            .tempdir()
+            .unwrap();
+        // The two scripts differ only in the exit status, so a `None` for one and a
+        // `Some` for the other can come from nothing but that status; a compiler that
+        // failed to spawn would give `None` for both.
+        let write_compiler = |name: &str, script: &str| {
+            let compiler = dir.path().join(name);
+            fs::write(&compiler, script).unwrap();
+            std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+            compiler
+        };
+        let working = write_compiler("working-cc", "#!/bin/sh\necho /usr/bin/as\n");
+        let failing = write_compiler("failing-cc", "#!/bin/sh\necho /usr/bin/as\nexit 1\n");
+
+        assert_eq!(
+            print_named_path(&working, &[], None, "prog", "as"),
+            Some(PathBuf::from("/usr/bin/as"))
+        );
+        assert_eq!(print_named_path(&failing, &[], None, "prog", "as"), None);
     }
 
     // The packaged toolchain resolves its sub-tools through the compile task's
