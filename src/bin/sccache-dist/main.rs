@@ -377,6 +377,10 @@ const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 // runs over a separate client<->server channel - so an over-eager reap at
 // worst mildly oversubscribes, which admission_ceiling already tolerates.
 const STARTED_COMPLETE_TIMEOUT: Duration = Duration::from_secs(180);
+// How often to repeat the "possible wedged build" warning for one job. A server
+// names a wedged job in every heartbeat (about every 30s), so warning on each one
+// writes the same line for as long as the build is stuck.
+const WEDGED_WARN_INTERVAL: Duration = Duration::from_secs(600);
 // Minimum time a job must have been in Started before the liveness lease may
 // reap it for two consecutive absent heartbeats. Must exceed the 30s
 // HEARTBEAT_INTERVAL (src/dist/http.rs) so a reapable job has been Started
@@ -399,6 +403,20 @@ struct JobDetail {
     // When the job entered its current state; used to reap Started jobs whose
     // Complete update was lost (see STARTED_COMPLETE_TIMEOUT).
     since: Instant,
+    // When the wedged-build warning for this job was last logged, so it repeats per
+    // WEDGED_WARN_INTERVAL rather than per heartbeat. Lives and dies with the job.
+    wedged_warned_at: Option<Instant>,
+}
+
+// Whether the wedged-build warning is due at `now`, recording it when so.
+fn wedged_warning_due(warned_at: &mut Option<Instant>, now: Instant) -> bool {
+    match *warned_at {
+        Some(last) if now.duration_since(last) < WEDGED_WARN_INTERVAL => false,
+        _ => {
+            *warned_at = Some(now);
+            true
+        }
+    }
 }
 
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
@@ -872,6 +890,7 @@ impl SchedulerIncoming for Scheduler {
                         server_id,
                         state,
                         since: Instant::now(),
+                        wedged_warned_at: None,
                     }
                 )
                 .is_none()
@@ -1015,7 +1034,7 @@ impl SchedulerIncoming for Scheduler {
                 // stopped naming the job in its heartbeats.
                 let mut stale_started = Vec::new();
                 for &job_id in details.jobs_assigned.iter() {
-                    if let Some(detail) = jobs.get(&job_id)
+                    if let Some(detail) = jobs.get_mut(&job_id)
                         && detail.state == JobState::Started
                         && now.duration_since(detail.since) > STARTED_COMPLETE_TIMEOUT
                     {
@@ -1024,13 +1043,16 @@ impl SchedulerIncoming for Scheduler {
                             // not reaped (a genuinely-slow live compile must
                             // survive) but likely a wedged build the server
                             // names forever. Surface it so it is visible in
-                            // logs rather than silently accumulating.
-                            warn!(
-                                "Started job {} on server {} still reported active past {:?}; possible wedged build",
-                                job_id,
-                                server_id.addr(),
-                                STARTED_COMPLETE_TIMEOUT
-                            );
+                            // logs rather than silently accumulating, once per
+                            // WEDGED_WARN_INTERVAL and not on every heartbeat.
+                            if wedged_warning_due(&mut detail.wedged_warned_at, now) {
+                                warn!(
+                                    "Started job {} on server {} still reported active past {:?}; possible wedged build",
+                                    job_id,
+                                    server_id.addr(),
+                                    STARTED_COMPLETE_TIMEOUT
+                                );
+                            }
                         } else {
                             stale_started.push(job_id);
                         }
@@ -1457,6 +1479,43 @@ impl ServerIncoming for Server {
 }
 
 #[cfg(test)]
+mod wedged_warning_tests {
+    use super::*;
+
+    // A job a server names forever is reported on every heartbeat, about every 30
+    // seconds. One warning per interval keeps it visible without burying the log.
+    #[test]
+    fn wedged_warning_fires_once_per_interval() {
+        let mut warned_at = None;
+        let t0 = Instant::now();
+
+        assert!(wedged_warning_due(&mut warned_at, t0));
+        assert!(
+            !wedged_warning_due(&mut warned_at, t0 + Duration::from_secs(30)),
+            "the next heartbeat must not repeat the warning"
+        );
+        assert!(
+            !wedged_warning_due(
+                &mut warned_at,
+                t0 + WEDGED_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            "still inside the interval"
+        );
+        assert!(
+            wedged_warning_due(&mut warned_at, t0 + WEDGED_WARN_INTERVAL),
+            "a still-wedged job is reported again once the interval has passed"
+        );
+        assert!(
+            !wedged_warning_due(
+                &mut warned_at,
+                t0 + WEDGED_WARN_INTERVAL + Duration::from_secs(30)
+            ),
+            "the interval restarts from the latest warning"
+        );
+    }
+}
+
+#[cfg(test)]
 mod scheduler_tests {
     use super::*;
     use std::net::SocketAddr;
@@ -1864,6 +1923,7 @@ mod scheduler_tests {
                 server_id,
                 state: JobState::Started,
                 since: Instant::now() - age,
+                wedged_warned_at: None,
             },
         );
     }
@@ -2030,6 +2090,7 @@ mod scheduler_tests {
                     server_id,
                     state: JobState::Pending,
                     since: old,
+                    wedged_warned_at: None,
                 },
             );
         }
@@ -2337,6 +2398,55 @@ mod scheduler_tests {
                 .contains(&job_id)
         );
         assert_eq!(0, scheduler.jobs_reaped_started.load(Ordering::Relaxed));
+    }
+
+    // The heartbeat handler throttles the wedged-build warning through the job's own
+    // stamp: set on the first heartbeat that names the stuck job, then left alone on
+    // the next so it does not warn again until the interval passes. Reading the
+    // stamp is the only way to see this without capturing the log.
+    #[test]
+    fn test_heartbeat_stamps_a_wedged_job_once_per_interval() {
+        let scheduler = Scheduler::new();
+        let server_id = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let job_id = JobId(1000);
+        insert_started_job(
+            &scheduler,
+            server_id,
+            job_id,
+            STARTED_COMPLETE_TIMEOUT + Duration::from_secs(10),
+        );
+        let nonce = nonce_of(&scheduler, server_id);
+        let stamp = || {
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .wedged_warned_at
+        };
+        let heartbeat = || {
+            scheduler
+                .handle_heartbeat_server(
+                    server_id,
+                    nonce.clone(),
+                    32,
+                    Box::new(TestJobAuthorizer),
+                    vec![job_id],
+                )
+                .unwrap();
+        };
+        assert_eq!(None, stamp(), "nothing is stamped before a heartbeat");
+
+        heartbeat();
+        let first = stamp().expect("the first heartbeat naming the stuck job stamps it");
+        heartbeat();
+
+        assert_eq!(
+            Some(first),
+            stamp(),
+            "a later heartbeat inside the interval must not move the stamp"
+        );
     }
 
     // A graceful deregister must drop the departing server's jobs from the
