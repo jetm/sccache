@@ -6,7 +6,7 @@ repos:
       - id: rust-fmt
         name: cargo fmt
         description: Format Rust sources included in the commit.
-        entry: cargo +nightly fmt --
+        entry: rustfmt +nightly --edition 2024
         pass_filenames: true
         types: [file, rust]
         language: system
