@@ -2355,35 +2355,38 @@ fn has_link_artifact_sibling(rlib: &Path) -> bool {
     })
 }
 
-/// Return a metadata-only archive for a trimmable rlib: the single-member `ar`
-/// holding its `rust.metadata.bin`, or `None` when the rlib has no embedded
-/// metadata member.
+/// Return a metadata-only archive for a trimmable rlib: an `ar` holding just
+/// its metadata members, in their original order, or `None` when the rlib has
+/// none.
 ///
-/// A rustc rlib normally carries its metadata as a `rust.metadata.bin` ar
-/// member, so a dependency only inspected for metadata can ship trimmed. But a
-/// split-metadata sysroot (e.g. an OpenEmbedded target `rustlib/<triple>/lib`,
-/// whose std/core rlibs keep metadata in a sibling `.rmeta` and carry only
-/// object members) has no such member. Callers must ship the whole rlib in
-/// that case -- trimming it to nothing drops the crate and leaves a remote
-/// compile unable to find `std`.
+/// Current rustc keeps metadata in `lib.rmeta` (plus `lib.rmeta-link` for
+/// linking metadata); older rustc used a single `rust.metadata.bin`. A
+/// dependent compile needs every one of them present. But a split-metadata
+/// sysroot (e.g. an OpenEmbedded target `rustlib/<triple>/lib`, whose std/core
+/// rlibs keep metadata in a sibling `.rmeta` and carry only object members) has
+/// no such member. Callers must ship the whole rlib in that case -- trimming it
+/// to nothing drops the crate and leaves a remote compile unable to find `std`.
 #[cfg(feature = "dist-client")]
 fn trimmed_rlib_metadata(input_path: &Path) -> Result<Option<Vec<u8>>> {
+    const METADATA_MEMBERS: [&[u8]; 3] = [b"lib.rmeta", b"lib.rmeta-link", b"rust.metadata.bin"];
+
     let file = fs::File::open(input_path)?;
     let mut archive = ar::Archive::new(file);
-    while let Some(entry_result) = archive.next_entry() {
-        let mut entry = entry_result?;
-        if entry.header().identifier() != b"rust.metadata.bin" {
-            continue;
-        }
-        let mut metadata_ar = vec![];
-        {
-            let mut ar_builder = ar::Builder::new(&mut metadata_ar);
+    let mut metadata_ar = vec![];
+    let mut kept = false;
+    {
+        let mut ar_builder = ar::Builder::new(&mut metadata_ar);
+        while let Some(entry_result) = archive.next_entry() {
+            let mut entry = entry_result?;
+            if !METADATA_MEMBERS.contains(&entry.header().identifier()) {
+                continue;
+            }
             let header = entry.header().clone();
             ar_builder.append(&header, &mut entry)?;
+            kept = true;
         }
-        return Ok(Some(metadata_ar));
     }
-    Ok(None)
+    Ok(kept.then_some(metadata_ar))
 }
 
 #[test]
@@ -2428,6 +2431,130 @@ fn test_trimmed_rlib_metadata() {
         trimmed.unwrap().windows(4).any(|w| w == b"META"),
         "the trimmed archive must contain the metadata member"
     );
+}
+
+#[cfg(all(test, feature = "dist-client"))]
+fn trimmed_rlib_member_names(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut archive = ar::Archive::new(bytes);
+    let mut names = vec![];
+    while let Some(entry) = archive.next_entry() {
+        names.push(entry.unwrap().header().identifier().to_vec());
+    }
+    names
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_keeps_every_metadata_member() {
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let rlib = tmp.path().join("libmulti.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&rlib).unwrap());
+        b.append(&ar::Header::new(b"lib.rmeta".to_vec(), 4), &b"RMET"[..])
+            .unwrap();
+        b.append(&ar::Header::new(b"foo.o".to_vec(), 3), &b"abc"[..])
+            .unwrap();
+        b.append(
+            &ar::Header::new(b"lib.rmeta-link".to_vec(), 4),
+            &b"LINK"[..],
+        )
+        .unwrap();
+    }
+    let trimmed = trimmed_rlib_metadata(&rlib).unwrap().unwrap();
+    assert_eq!(
+        trimmed_rlib_member_names(&trimmed),
+        vec![b"lib.rmeta".to_vec(), b"lib.rmeta-link".to_vec()],
+        "both metadata members, in order, and no object member"
+    );
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_objects_only_ships_whole() {
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let rlib = tmp.path().join("libobjs.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&rlib).unwrap());
+        b.append(&ar::Header::new(b"a.o".to_vec(), 1), &b"a"[..])
+            .unwrap();
+        b.append(&ar::Header::new(b"b.o".to_vec(), 1), &b"b"[..])
+            .unwrap();
+    }
+    assert!(trimmed_rlib_metadata(&rlib).unwrap().is_none());
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_is_usable_by_rustc() {
+    use std::ffi::{OsStr, OsString};
+
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+
+    let run = |args: &[&OsStr]| {
+        let out = std::process::Command::new(&rustc)
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("rustc must be runnable");
+        assert!(
+            out.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    fs::write(dir.join("dep.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    fs::write(
+        dir.join("user.rs"),
+        "pub fn twice() -> u32 { dep::answer() * 2 }\n",
+    )
+    .unwrap();
+
+    let full_dir = dir.join("full");
+    let trimmed_dir = dir.join("trimmed");
+    let out_dir = dir.join("out");
+    for d in [&full_dir, &trimmed_dir, &out_dir] {
+        fs::create_dir(d).unwrap();
+    }
+
+    run(&[
+        OsStr::new("--crate-type=rlib"),
+        OsStr::new("--crate-name=dep"),
+        OsStr::new("--edition=2021"),
+        OsStr::new("--out-dir"),
+        full_dir.as_os_str(),
+        OsStr::new("dep.rs"),
+    ]);
+
+    let trimmed = trimmed_rlib_metadata(&full_dir.join("libdep.rlib"))
+        .unwrap()
+        .expect("a real rustc rlib has metadata members");
+    let trimmed_path = trimmed_dir.join("libdep.rlib");
+    fs::write(&trimmed_path, &trimmed).unwrap();
+
+    let mut extern_arg = OsString::from("dep=");
+    extern_arg.push(&trimmed_path);
+    run(&[
+        OsStr::new("--crate-type=rlib"),
+        OsStr::new("--crate-name=user"),
+        OsStr::new("--edition=2021"),
+        OsStr::new("--extern"),
+        extern_arg.as_os_str(),
+        OsStr::new("--out-dir"),
+        out_dir.as_os_str(),
+        OsStr::new("user.rs"),
+    ]);
 }
 
 #[test]
