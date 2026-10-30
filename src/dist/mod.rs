@@ -731,7 +731,9 @@ pub trait SchedulerIncoming: Send + Sync {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
-        active_jobs: Vec<JobId>,
+        // None: the server predates the active-jobs report, so its heartbeat
+        // says nothing about which jobs are still running.
+        active_jobs: Option<Vec<JobId>>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server
     fn handle_deregister_server(

@@ -856,7 +856,7 @@ mod server {
                             server_id, server_nonce,
                             num_cpus,
                             job_authorizer,
-                            active_jobs
+                            Some(active_jobs)
                         ));
                         prepare_response(request, &res)
                     },

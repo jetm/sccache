@@ -913,7 +913,7 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
-        active_jobs: Vec<JobId>,
+        active_jobs: Option<Vec<JobId>>,
     ) -> Result<HeartbeatServerResult> {
         if num_cpus == 0 {
             bail!("Invalid number of CPUs (0) specified in heartbeat")
@@ -988,86 +988,91 @@ impl SchedulerIncoming for Scheduler {
                     }
                 }
 
-                // Primary Started-reap mechanism: the liveness lease. Every
-                // heartbeat carries the ids the server is actively running.
-                // Reap a Started job only once it is absent from BOTH the
-                // incoming active_jobs AND last_active_jobs (the prior beat) -
-                // two consecutive misses - so a genuinely-slow live compile,
-                // which the server reports every beat, is never reaped, and one
-                // dropped or racing heartbeat cannot reap a live job. The
-                // fixed-timeout sweep below stays only as a backstop for a
-                // server that stops heartbeating its running set entirely.
-                let active_set: HashSet<JobId> = active_jobs.into_iter().collect();
-                let mut liveness_reap = Vec::new();
-                for &job_id in details.jobs_assigned.iter() {
-                    if let Some(detail) = jobs.get(&job_id)
-                        && detail.state == JobState::Started
-                        && !active_set.contains(&job_id)
-                        && !details.last_active_jobs.contains(&job_id)
-                        && now.duration_since(detail.since) > LIVENESS_GRACE
-                    {
-                        liveness_reap.push(job_id);
-                    }
-                }
-                if !liveness_reap.is_empty() {
-                    warn!(
-                        "The following Started jobs were absent from two consecutive heartbeats and will be de-allocated: {:?}",
-                        liveness_reap
-                    );
-                    self.jobs_reaped_started
-                        .fetch_add(liveness_reap.len(), Ordering::Relaxed);
-                    for job_id in liveness_reap {
-                        details.jobs_assigned.remove(&job_id);
-                        jobs.remove(&job_id);
-                    }
-                }
-                details.last_active_jobs = active_set;
-
-                // Backstop for jobs stuck in Started (see STARTED_COMPLETE_TIMEOUT):
-                // the unclaimed sweep above cannot see them because Ready->Started
-                // drops them from jobs_unclaimed. Reap any this server has held in
-                // Started past the timeout so a lost Complete update cannot leak the
-                // slot forever and eventually lock the node out at its ceiling.
-                // Never reap a job the server just reported active (now stored in
-                // last_active_jobs): a genuinely-slow live compile must survive at
-                // any duration, so the backstop only fires once the server has
-                // stopped naming the job in its heartbeats.
-                let mut stale_started = Vec::new();
-                for &job_id in details.jobs_assigned.iter() {
-                    if let Some(detail) = jobs.get_mut(&job_id)
-                        && detail.state == JobState::Started
-                        && now.duration_since(detail.since) > STARTED_COMPLETE_TIMEOUT
-                    {
-                        if details.last_active_jobs.contains(&job_id) {
-                            // Still reported active past the backstop timeout:
-                            // not reaped (a genuinely-slow live compile must
-                            // survive) but likely a wedged build the server
-                            // names forever. Surface it so it is visible in
-                            // logs rather than silently accumulating, once per
-                            // WEDGED_WARN_INTERVAL and not on every heartbeat.
-                            if wedged_warning_due(&mut detail.wedged_warned_at, now) {
-                                warn!(
-                                    "Started job {} on server {} still reported active past {:?}; possible wedged build",
-                                    job_id,
-                                    server_id.addr(),
-                                    STARTED_COMPLETE_TIMEOUT
-                                );
-                            }
-                        } else {
-                            stale_started.push(job_id);
+                // A server with no report (None) gave no liveness information,
+                // so neither the lease nor the backstop below may reclaim its
+                // Started jobs; it is only pruned once it stops heartbeating.
+                if let Some(active_jobs) = active_jobs {
+                    // Primary Started-reap mechanism: the liveness lease. Every
+                    // heartbeat carries the ids the server is actively running.
+                    // Reap a Started job only once it is absent from BOTH the
+                    // incoming active_jobs AND last_active_jobs (the prior beat) -
+                    // two consecutive misses - so a genuinely-slow live compile,
+                    // which the server reports every beat, is never reaped, and one
+                    // dropped or racing heartbeat cannot reap a live job. The
+                    // fixed-timeout sweep below stays only as a backstop for a
+                    // server that stops heartbeating its running set entirely.
+                    let active_set: HashSet<JobId> = active_jobs.into_iter().collect();
+                    let mut liveness_reap = Vec::new();
+                    for &job_id in details.jobs_assigned.iter() {
+                        if let Some(detail) = jobs.get(&job_id)
+                            && detail.state == JobState::Started
+                            && !active_set.contains(&job_id)
+                            && !details.last_active_jobs.contains(&job_id)
+                            && now.duration_since(detail.since) > LIVENESS_GRACE
+                        {
+                            liveness_reap.push(job_id);
                         }
                     }
-                }
-                if !stale_started.is_empty() {
-                    warn!(
-                        "The following Started jobs had no Complete within {:?} and will be de-allocated: {:?}",
-                        STARTED_COMPLETE_TIMEOUT, stale_started
-                    );
-                    self.jobs_reaped_started
-                        .fetch_add(stale_started.len(), Ordering::Relaxed);
-                    for job_id in stale_started {
-                        details.jobs_assigned.remove(&job_id);
-                        jobs.remove(&job_id);
+                    if !liveness_reap.is_empty() {
+                        warn!(
+                            "The following Started jobs were absent from two consecutive heartbeats and will be de-allocated: {:?}",
+                            liveness_reap
+                        );
+                        self.jobs_reaped_started
+                            .fetch_add(liveness_reap.len(), Ordering::Relaxed);
+                        for job_id in liveness_reap {
+                            details.jobs_assigned.remove(&job_id);
+                            jobs.remove(&job_id);
+                        }
+                    }
+                    details.last_active_jobs = active_set;
+
+                    // Backstop for jobs stuck in Started (see STARTED_COMPLETE_TIMEOUT):
+                    // the unclaimed sweep above cannot see them because Ready->Started
+                    // drops them from jobs_unclaimed. Reap any this server has held in
+                    // Started past the timeout so a lost Complete update cannot leak the
+                    // slot forever and eventually lock the node out at its ceiling.
+                    // Never reap a job the server just reported active (now stored in
+                    // last_active_jobs): a genuinely-slow live compile must survive at
+                    // any duration, so the backstop only fires once the server has
+                    // stopped naming the job in its heartbeats.
+                    let mut stale_started = Vec::new();
+                    for &job_id in details.jobs_assigned.iter() {
+                        if let Some(detail) = jobs.get_mut(&job_id)
+                            && detail.state == JobState::Started
+                            && now.duration_since(detail.since) > STARTED_COMPLETE_TIMEOUT
+                        {
+                            if details.last_active_jobs.contains(&job_id) {
+                                // Still reported active past the backstop timeout:
+                                // not reaped (a genuinely-slow live compile must
+                                // survive) but likely a wedged build the server
+                                // names forever. Surface it so it is visible in
+                                // logs rather than silently accumulating, once per
+                                // WEDGED_WARN_INTERVAL and not on every heartbeat.
+                                if wedged_warning_due(&mut detail.wedged_warned_at, now) {
+                                    warn!(
+                                        "Started job {} on server {} still reported active past {:?}; possible wedged build",
+                                        job_id,
+                                        server_id.addr(),
+                                        STARTED_COMPLETE_TIMEOUT
+                                    );
+                                }
+                            } else {
+                                stale_started.push(job_id);
+                            }
+                        }
+                    }
+                    if !stale_started.is_empty() {
+                        warn!(
+                            "The following Started jobs had no Complete within {:?} and will be de-allocated: {:?}",
+                            STARTED_COMPLETE_TIMEOUT, stale_started
+                        );
+                        self.jobs_reaped_started
+                            .fetch_add(stale_started.len(), Ordering::Relaxed);
+                        for job_id in stale_started {
+                            details.jobs_assigned.remove(&job_id);
+                            jobs.remove(&job_id);
+                        }
                     }
                 }
 
@@ -1104,6 +1109,12 @@ impl SchedulerIncoming for Scheduler {
             _ => (),
         }
         info!("Registered new server {:?}", server_id);
+        if active_jobs.is_none() {
+            info!(
+                "Server {} sends no active-jobs report; its Started jobs are reclaimed only when it stops heartbeating",
+                server_id.addr()
+            );
+        }
         servers.insert(
             server_id,
             ServerDetails {
@@ -1576,7 +1587,7 @@ mod scheduler_tests {
                 self.server_nonce.clone(),
                 1,
                 Box::new(TestJobAuthorizer),
-                Vec::new(),
+                Some(Vec::new()),
             )?;
             assert!(!heartbeat.is_new);
 
@@ -1599,7 +1610,7 @@ mod scheduler_tests {
                 server_nonce.clone(),
                 1,
                 Box::new(TestJobAuthorizer),
-                Vec::new(),
+                Some(Vec::new()),
             )
             .unwrap();
 
@@ -1973,7 +1984,7 @@ mod scheduler_tests {
                 nonce,
                 32,
                 Box::new(TestJobAuthorizer),
-                Vec::new(),
+                Some(Vec::new()),
             )
             .expect("handle_heartbeat_server should not error");
 
@@ -2022,7 +2033,7 @@ mod scheduler_tests {
                 nonce,
                 32,
                 Box::new(TestJobAuthorizer),
-                vec![job_id],
+                Some(vec![job_id]),
             )
             .expect("handle_heartbeat_server should not error");
 
@@ -2193,7 +2204,7 @@ mod scheduler_tests {
                     nonce.clone(),
                     32,
                     Box::new(TestJobAuthorizer),
-                    vec![job_id],
+                    Some(vec![job_id]),
                 )
                 .expect("handle_heartbeat_server should not error");
             let servers = scheduler.servers.lock().unwrap();
@@ -2214,7 +2225,7 @@ mod scheduler_tests {
                 nonce.clone(),
                 32,
                 Box::new(TestJobAuthorizer),
-                Vec::new(),
+                Some(Vec::new()),
             )
             .expect("handle_heartbeat_server should not error");
         assert!(
@@ -2236,7 +2247,7 @@ mod scheduler_tests {
                 nonce,
                 32,
                 Box::new(TestJobAuthorizer),
-                Vec::new(),
+                Some(Vec::new()),
             )
             .expect("handle_heartbeat_server should not error");
         {
@@ -2289,7 +2300,7 @@ mod scheduler_tests {
                     nonce.clone(),
                     32,
                     Box::new(TestJobAuthorizer),
-                    Vec::new(),
+                    Some(Vec::new()),
                 )
                 .expect("handle_heartbeat_server should not error");
         }
@@ -2382,7 +2393,7 @@ mod scheduler_tests {
                 nonce,
                 32,
                 Box::new(TestJobAuthorizer),
-                vec![job_id],
+                Some(vec![job_id]),
             )
             .unwrap();
 
@@ -2432,7 +2443,7 @@ mod scheduler_tests {
                     nonce.clone(),
                     32,
                     Box::new(TestJobAuthorizer),
-                    vec![job_id],
+                    Some(vec![job_id]),
                 )
                 .unwrap();
         };
@@ -2447,6 +2458,133 @@ mod scheduler_tests {
             stamp(),
             "a later heartbeat inside the interval must not move the stamp"
         );
+    }
+
+    // A server built before the active-jobs report says nothing about which jobs
+    // it is running, so neither the two-miss lease nor the fixed backstop may
+    // reclaim its Started jobs: a live compile of any duration must survive.
+    #[test]
+    fn test_heartbeat_without_report_keeps_an_old_started_job() {
+        let scheduler = Scheduler::new();
+        let server_id = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let job_id = JobId(1000);
+        let age = STARTED_COMPLETE_TIMEOUT.max(LIVENESS_GRACE) + Duration::from_secs(10);
+        insert_started_job(&scheduler, server_id, job_id, age);
+        let nonce = nonce_of(&scheduler, server_id);
+        let prior: HashSet<JobId> = [JobId(7)].into_iter().collect();
+        scheduler
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut(&server_id)
+            .unwrap()
+            .last_active_jobs = prior.clone();
+
+        for _ in 0..2 {
+            let res = scheduler
+                .handle_heartbeat_server(
+                    server_id,
+                    nonce.clone(),
+                    32,
+                    Box::new(TestJobAuthorizer),
+                    None,
+                )
+                .unwrap();
+            assert!(!res.is_new);
+        }
+
+        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert!(details.jobs_assigned.contains(&job_id));
+        assert_eq!(prior, details.last_active_jobs);
+        assert_eq!(0, scheduler.jobs_reaped_started.load(Ordering::Relaxed));
+    }
+
+    // The same job under heartbeats that do carry a report, an empty one, is
+    // reclaimed: the None path must not have widened into the Some path.
+    #[test]
+    fn test_heartbeat_with_empty_report_reclaims_an_old_started_job() {
+        let scheduler = Scheduler::new();
+        let server_id = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let job_id = JobId(1000);
+        let age = STARTED_COMPLETE_TIMEOUT.max(LIVENESS_GRACE) + Duration::from_secs(10);
+        insert_started_job(&scheduler, server_id, job_id, age);
+        let nonce = nonce_of(&scheduler, server_id);
+
+        for _ in 0..2 {
+            scheduler
+                .handle_heartbeat_server(
+                    server_id,
+                    nonce.clone(),
+                    32,
+                    Box::new(TestJobAuthorizer),
+                    Some(Vec::new()),
+                )
+                .unwrap();
+        }
+
+        assert!(!scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        assert!(
+            !scheduler
+                .servers
+                .lock()
+                .unwrap()
+                .get(&server_id)
+                .unwrap()
+                .jobs_assigned
+                .contains(&job_id)
+        );
+        assert_eq!(1, scheduler.jobs_reaped_started.load(Ordering::Relaxed));
+    }
+
+    // Skipping the reap must not make a reportless server immortal: once it stops
+    // heartbeating it is pruned like any silent server, and its jobs with it.
+    #[test]
+    fn test_heartbeat_without_report_server_that_goes_silent_is_pruned() {
+        let scheduler = Scheduler::new();
+        let silent = ServerId::new("10.42.0.2:10501".parse::<SocketAddr>().unwrap());
+        let res = scheduler
+            .handle_heartbeat_server(
+                silent,
+                ServerNonce::new(),
+                32,
+                Box::new(TestJobAuthorizer),
+                None,
+            )
+            .unwrap();
+        assert!(res.is_new);
+        let job_id = JobId(1000);
+        {
+            let mut servers = scheduler.servers.lock().unwrap();
+            let details = servers.get_mut(&silent).unwrap();
+            details.jobs_assigned.insert(job_id);
+            details.last_seen =
+                Instant::now() - dist::http::HEARTBEAT_TIMEOUT - Duration::from_secs(1);
+        }
+        scheduler.jobs.lock().unwrap().insert(
+            job_id,
+            JobDetail {
+                server_id: silent,
+                state: JobState::Started,
+                since: Instant::now(),
+                wedged_warned_at: None,
+            },
+        );
+
+        let other = ServerId::new("10.42.0.3:10501".parse::<SocketAddr>().unwrap());
+        scheduler
+            .handle_heartbeat_server(
+                other,
+                ServerNonce::new(),
+                32,
+                Box::new(TestJobAuthorizer),
+                None,
+            )
+            .unwrap();
+
+        assert!(!scheduler.servers.lock().unwrap().contains_key(&silent));
+        assert!(!scheduler.jobs.lock().unwrap().contains_key(&job_id));
     }
 
     // A graceful deregister must drop the departing server's jobs from the
