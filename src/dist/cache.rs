@@ -583,9 +583,9 @@ impl TcCache {
     }
 
     /// Insert an already-materialized toolchain file into the cache by moving it
-    /// under `tc`'s key. The caller streams the upload to a temp file first, so
-    /// the transfer runs without holding the cache lock; this method takes the
-    /// lock only to graft the finished file in.
+    /// under `tc`'s key, then re-hash it to verify the key. The re-hash runs
+    /// under whatever lock the caller holds; callers that verified the content
+    /// themselves use `insert_verified_at` instead.
     pub fn insert_at(&mut self, tc: &Toolchain, path: &Path) -> Result<()> {
         self.inner
             .insert_file(make_lru_key_path(&tc.archive_id), path)?;
@@ -598,6 +598,15 @@ impl TcCache {
             let _ = self.inner.remove(make_lru_key_path(&tc.archive_id));
             Err(anyhow!("written file does not match expected hash key"))
         }
+    }
+
+    /// Move a toolchain file whose content the caller already hashed to `tc`'s
+    /// key into the cache. Skips the re-hash so the cache lock covers only the
+    /// rename.
+    pub fn insert_verified_at(&mut self, tc: &Toolchain, path: &Path) -> Result<()> {
+        self.inner
+            .insert_file(make_lru_key_path(&tc.archive_id), path)?;
+        Ok(())
     }
 
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {

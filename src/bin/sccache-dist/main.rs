@@ -1339,6 +1339,19 @@ fn store_toolchain(
     result
 }
 
+struct HashingReader<'a> {
+    inner: &'a mut dyn io::Read,
+    digest: sccache::util::Digest,
+}
+
+impl io::Read for HashingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.digest.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 fn receive_toolchain(
     cache: &Mutex<TcCache>,
     tc: &Toolchain,
@@ -1358,15 +1371,24 @@ fn receive_toolchain(
     let Ok(mut tmpfile) = tempfile::NamedTempFile::new_in(&tc_cache_dir) else {
         return SubmitToolchainResult::CannotCache;
     };
-    if io::copy(tc_rdr, tmpfile.as_file_mut()).is_err() {
+    // Hash while copying so verification costs no lock and no second read, and a
+    // forged upload is dropped before it can evict anything.
+    let mut hashing = HashingReader {
+        inner: tc_rdr,
+        digest: sccache::util::Digest::default(),
+    };
+    if io::copy(&mut hashing, tmpfile.as_file_mut()).is_err() {
+        return SubmitToolchainResult::CannotCache;
+    }
+    if hashing.digest.finish() != tc.archive_id {
         return SubmitToolchainResult::CannotCache;
     }
     let temp_path = tmpfile.into_temp_path();
-    // Re-acquire the cache lock ONLY to graft the finished file into the cache.
+    // Re-acquire the cache lock ONLY to rename the verified file into the cache.
     cache
         .lock()
         .unwrap()
-        .insert_at(tc, &temp_path)
+        .insert_verified_at(tc, &temp_path)
         .map(|_| SubmitToolchainResult::Success)
         .unwrap_or(SubmitToolchainResult::CannotCache)
 }
@@ -2669,6 +2691,91 @@ mod scheduler_tests {
             self.read.fetch_add(n, Ordering::SeqCst);
             Ok(n)
         }
+    }
+
+    fn toolchain_of(bytes: &[u8]) -> Toolchain {
+        let archive_id =
+            sccache::util::Digest::reader_sync(io::Cursor::new(bytes.to_vec())).unwrap();
+        Toolchain { archive_id }
+    }
+
+    // A forged upload must be rejected before it reaches the cache; grafting it
+    // first would evict a valid toolchain to make room for content that is then
+    // thrown away.
+    #[test]
+    fn test_receive_toolchain_rejects_bad_hash_without_evicting() {
+        let good = vec![7u8; 1000];
+        let good_tc = toolchain_of(&good);
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Mutex::new(TcCache::new(cache_dir.path(), 1500).unwrap());
+        let mut rdr = io::Cursor::new(good.clone());
+        assert!(matches!(
+            receive_toolchain(&cache, &good_tc, &mut rdr),
+            SubmitToolchainResult::Success
+        ));
+
+        let forged_tc = toolchain_of(b"the content the id claims");
+        let mut rdr = io::Cursor::new(vec![9u8; 1000]);
+        assert!(matches!(
+            receive_toolchain(&cache, &forged_tc, &mut rdr),
+            SubmitToolchainResult::CannotCache
+        ));
+
+        let cache = cache.lock().unwrap();
+        assert!(cache.contains_toolchain(&good_tc));
+        assert!(!cache.contains_toolchain(&forged_tc));
+    }
+
+    #[test]
+    fn test_receive_toolchain_caches_matching_upload_larger_than_copy_buffer() {
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let tc = toolchain_of(&bytes);
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Mutex::new(TcCache::new(cache_dir.path(), u64::MAX).unwrap());
+        let mut rdr = io::Cursor::new(bytes);
+        assert!(matches!(
+            receive_toolchain(&cache, &tc, &mut rdr),
+            SubmitToolchainResult::Success
+        ));
+        assert!(cache.lock().unwrap().contains_toolchain(&tc));
+    }
+
+    struct LockProbeReader<'a> {
+        data: io::Cursor<Vec<u8>>,
+        cache: &'a Mutex<TcCache>,
+        reads: usize,
+        lock_busy: bool,
+    }
+
+    impl io::Read for LockProbeReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.cache.try_lock().is_err() {
+                self.lock_busy = true;
+            }
+            self.data.read(buf)
+        }
+    }
+
+    // The hash must be computed while streaming, not under the global cache lock.
+    #[test]
+    fn test_receive_toolchain_does_not_hold_cache_lock_during_transfer() {
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        let tc = toolchain_of(&bytes);
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Mutex::new(TcCache::new(cache_dir.path(), u64::MAX).unwrap());
+        let mut rdr = LockProbeReader {
+            data: io::Cursor::new(bytes),
+            cache: &cache,
+            reads: 0,
+            lock_busy: false,
+        };
+        assert!(matches!(
+            receive_toolchain(&cache, &tc, &mut rdr),
+            SubmitToolchainResult::Success
+        ));
+        assert!(rdr.reads > 1);
+        assert!(!rdr.lock_busy, "cache lock was held during a read");
     }
 
     // Two clients submitting the same uncached toolchain used to both stream it to
