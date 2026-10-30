@@ -45,6 +45,8 @@ use std::sync::{Arc, LazyLock};
 use crate::errors::*;
 
 use super::CacheControl;
+#[cfg(feature = "dist-client")]
+use super::compiler::InflightGuard;
 use super::preprocessor_cache::PreprocessorCacheEntry;
 
 /// Live count of local preprocess (`cc1 -E`) invocations, gauged so the PC1
@@ -53,27 +55,6 @@ use super::preprocessor_cache::PreprocessorCacheEntry;
 /// an inference.
 #[cfg(feature = "dist-client")]
 static PREPROC_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// RAII counter for `PREPROC_INFLIGHT`: increments on `enter`, returning the
-/// concurrency including this one, and decrements on drop so the count stays
-/// correct across every exit of the preprocess future.
-#[cfg(feature = "dist-client")]
-struct PreprocInflightGuard;
-
-#[cfg(feature = "dist-client")]
-impl PreprocInflightGuard {
-    fn enter() -> (Self, usize) {
-        let inflight = PREPROC_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        (PreprocInflightGuard, inflight)
-    }
-}
-
-#[cfg(feature = "dist-client")]
-impl Drop for PreprocInflightGuard {
-    fn drop(&mut self) {
-        PREPROC_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -605,7 +586,7 @@ where
             #[cfg(feature = "dist-client")]
             let preprocess_start = std::time::Instant::now();
             #[cfg(feature = "dist-client")]
-            let (preproc_guard, preproc_concurrency) = PreprocInflightGuard::enter();
+            let (preproc_guard, preproc_concurrency) = InflightGuard::enter(&PREPROC_INFLIGHT);
             let result = self
                 .compiler
                 .preprocess(

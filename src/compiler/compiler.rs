@@ -883,25 +883,26 @@ where
 #[cfg(feature = "dist-client")]
 static DIST_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// RAII counter for `DIST_INFLIGHT`: increments on `enter` and decrements on
-/// drop, so the count stays correct across every exit of the dist future -
+/// RAII counter over one of the in-flight statics above: increments on
+/// `enter`, returning the concurrency including this one, and decrements on
+/// drop, so the count stays correct across every exit of the guarded future -
 /// success, `?`, `bail!`, or a dropped future - without a manual decrement in
 /// each error arm and the local-fallback path.
 #[cfg(feature = "dist-client")]
-struct DistInflightGuard;
+pub(super) struct InflightGuard(&'static std::sync::atomic::AtomicUsize);
 
 #[cfg(feature = "dist-client")]
-impl DistInflightGuard {
-    fn enter() -> (Self, usize) {
-        let inflight = DIST_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        (DistInflightGuard, inflight)
+impl InflightGuard {
+    pub(super) fn enter(counter: &'static std::sync::atomic::AtomicUsize) -> (Self, usize) {
+        let inflight = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        (InflightGuard(counter), inflight)
     }
 }
 
 #[cfg(feature = "dist-client")]
-impl Drop for DistInflightGuard {
+impl Drop for InflightGuard {
     fn drop(&mut self) {
-        DIST_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -951,7 +952,7 @@ where
     let local_executable2 = compile_cmd.get_executable();
 
     let do_dist_compile = async move {
-        let (_inflight_guard, in_flight) = DistInflightGuard::enter();
+        let (_inflight_guard, in_flight) = InflightGuard::enter(&DIST_INFLIGHT);
         let dist_started = Instant::now();
         info!("[{}]: dist-job start (in_flight {})", out_pretty, in_flight);
         // Local preprocessing (`cc1 -E`) already ran during hash-key generation,
@@ -2238,6 +2239,23 @@ mod test {
     use std::time::Duration;
     use test_case::test_case;
     use tokio::runtime::Runtime;
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_inflight_guard_counts_enter_and_releases_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let (first, n1) = InflightGuard::enter(&COUNTER);
+        let (second, n2) = InflightGuard::enter(&COUNTER);
+        assert_eq!((n1, n2), (1, 2));
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+
+        drop(first);
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        drop(second);
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn test_c_preprocessing_consistent() {
@@ -4351,6 +4369,39 @@ mod test_dist {
 
     use crate::errors::*;
 
+    /// What every mock returns from `put_toolchain` when it overrides the
+    /// compiler: the mock's toolchain plus a fixed overridden executable.
+    fn overridden_toolchain(tc: &Toolchain) -> (Toolchain, Option<(String, PathBuf)>) {
+        (
+            tc.clone(),
+            Some((
+                "/overridden/compiler".to_owned(),
+                PathBuf::from("somearchiveid"),
+            )),
+        )
+    }
+
+    /// A successful remote run that returns `some data in <name>` for every
+    /// output in `outputs`.
+    fn complete_job(
+        output: ProcessOutput,
+        outputs: Vec<String>,
+        path_transformer: PathTransformer,
+    ) -> (RunJobResult, PathTransformer) {
+        let outputs = outputs
+            .into_iter()
+            .map(|name| {
+                let data = format!("some data in {}", name);
+                let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                (name, data)
+            })
+            .collect();
+        (
+            RunJobResult::Complete(JobComplete { output, outputs }),
+            path_transformer,
+        )
+    }
+
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
         #[allow(clippy::new_ret_no_self)]
@@ -4586,13 +4637,7 @@ mod test_dist {
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
         ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
-            Ok((
-                self.tc.clone(),
-                Some((
-                    "/overridden/compiler".to_owned(),
-                    PathBuf::from("somearchiveid"),
-                )),
-            ))
+            Ok(overridden_toolchain(&self.tc))
         }
         fn rewrite_includes_only(&self) -> bool {
             false
@@ -4676,19 +4721,7 @@ mod test_dist {
 
             let mut inputs = vec![];
             let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
-            let outputs = outputs
-                .into_iter()
-                .map(|name| {
-                    let data = format!("some data in {}", name);
-                    let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
-                    (name, data)
-                })
-                .collect();
-            let result = RunJobResult::Complete(JobComplete {
-                output: self.output.clone(),
-                outputs,
-            });
-            Ok((result, path_transformer))
+            Ok(complete_job(self.output.clone(), outputs, path_transformer))
         }
         async fn put_toolchain(
             &self,
@@ -4696,13 +4729,7 @@ mod test_dist {
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
         ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
-            Ok((
-                self.tc.clone(),
-                Some((
-                    "/overridden/compiler".to_owned(),
-                    PathBuf::from("somearchiveid"),
-                )),
-            ))
+            Ok(overridden_toolchain(&self.tc))
         }
         fn rewrite_includes_only(&self) -> bool {
             false
@@ -4824,19 +4851,7 @@ mod test_dist {
                     outputs.pop();
                 }
             }
-            let outputs = outputs
-                .into_iter()
-                .map(|name| {
-                    let data = format!("some data in {}", name);
-                    let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
-                    (name, data)
-                })
-                .collect();
-            let result = RunJobResult::Complete(JobComplete {
-                output: self.output.clone(),
-                outputs,
-            });
-            Ok((result, path_transformer))
+            Ok(complete_job(self.output.clone(), outputs, path_transformer))
         }
         async fn put_toolchain(
             &self,
@@ -4844,13 +4859,7 @@ mod test_dist {
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
         ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
-            Ok((
-                self.tc.clone(),
-                Some((
-                    "/overridden/compiler".to_owned(),
-                    PathBuf::from("somearchiveid"),
-                )),
-            ))
+            Ok(overridden_toolchain(&self.tc))
         }
         fn fallback_enabled(&self) -> bool {
             self.fallback
