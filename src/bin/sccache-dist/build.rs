@@ -344,21 +344,41 @@ impl OverlayBuilder {
             let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
             toolchain_dir_map.insert(tc.clone(), entry.clone());
             if toolchain_dir_map.len() > tccache.lock().unwrap().len() {
-                for victim in pick_eviction_victims(&toolchain_dir_map, tc) {
-                    if toolchain_dir_map.remove(&victim).is_some() {
-                        evictions.push(victim);
-                    } else {
-                        warn!(
-                            "toolchain {:?} already gone from dir map during eviction",
-                            victim
-                        );
-                    }
-                }
+                evictions = self.take_eviction_victims(&mut toolchain_dir_map, tc);
             }
         }
         self.evict_toolchains(evictions)?;
 
         self.make_overlay_spec(tc, entry)
+    }
+
+    // Remove from the map and return the eviction victims that are not being prepared.
+    // A victim whose preparation lock is held keeps its map entry: dropping it would
+    // let its racer's next lookup treat the live directory as a stale leftover and
+    // delete it. Lock order: the caller holds the map lock, and the preparation lock
+    // is only ever try-locked here, so this cannot deadlock against a racer.
+    fn take_eviction_victims(
+        &self,
+        toolchain_dir_map: &mut HashMap<Toolchain, DeflatedToolchain>,
+        keep: &Toolchain,
+    ) -> Vec<Toolchain> {
+        let mut victims = Vec::new();
+        for victim in pick_eviction_victims(toolchain_dir_map, keep) {
+            let victim_lock = get_toolchain_lock(&self.toolchain_prepare_locks, &victim);
+            if victim_lock.try_lock().is_err() {
+                trace!("Not evicting {:?}: being prepared", victim);
+                continue;
+            }
+            if toolchain_dir_map.remove(&victim).is_some() {
+                victims.push(victim);
+            } else {
+                warn!(
+                    "toolchain {:?} already gone from dir map during eviction",
+                    victim
+                );
+            }
+        }
+        victims
     }
 
     // Delete the unpacked directory of each victim that is neither being prepared nor
@@ -1350,5 +1370,100 @@ mod tests {
         assert_eq!(2, victims.len());
         assert!(!victims.contains(&fresh));
         assert!(victims.contains(&tc("1111")) && victims.contains(&tc("2222")));
+    }
+
+    // Three prepared toolchains plus the one to keep, `old` being the oldest.
+    fn evict_fixture(builder: &OverlayBuilder) -> (Toolchain, Toolchain, Toolchain) {
+        let mut map = builder.toolchain_dir_map.lock().unwrap();
+        let keep = tc("keep");
+        let (old, mid) = (tc("old1"), tc("mid1"));
+        map.insert(keep.clone(), deflated(100));
+        map.insert(old.clone(), deflated(30));
+        map.insert(mid.clone(), deflated(20));
+        map.insert(tc("new1"), deflated(10));
+        (keep, old, mid)
+    }
+
+    // A victim being prepared by a racer must keep its map entry: dropping it would
+    // make the next request treat the live directory as a stale leftover.
+    #[test]
+    fn test_evict_selection_skips_a_victim_whose_lock_is_held() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_sel")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &["old1", "mid1"]);
+        let (keep, old, mid) = evict_fixture(&builder);
+        let lock = get_toolchain_lock(&builder.toolchain_prepare_locks, &old);
+        let _held = lock.lock().unwrap();
+
+        let mut map = builder.toolchain_dir_map.lock().unwrap();
+        let victims = builder.take_eviction_victims(&mut map, &keep);
+
+        assert_eq!(vec![mid.clone()], victims);
+        assert!(map.contains_key(&old), "a held victim stays in the map");
+        assert!(!map.contains_key(&mid));
+        drop(map);
+        assert!(toolchain_dir_exists(&builder, "old1"));
+    }
+
+    #[test]
+    fn test_evict_selection_removes_and_returns_idle_victims() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_idle")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &[]);
+        let (keep, old, mid) = evict_fixture(&builder);
+
+        let mut map = builder.toolchain_dir_map.lock().unwrap();
+        let mut victims = builder.take_eviction_victims(&mut map, &keep);
+        victims.sort_by(|a, b| a.archive_id.cmp(&b.archive_id));
+
+        assert_eq!(vec![mid.clone(), old.clone()], victims);
+        assert!(!map.contains_key(&old) && !map.contains_key(&mid));
+        assert_eq!(2, map.len());
+    }
+
+    #[test]
+    fn test_evict_selection_never_returns_the_toolchain_to_keep() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_keep")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &[]);
+        let (keep, _, _) = evict_fixture(&builder);
+
+        let mut map = builder.toolchain_dir_map.lock().unwrap();
+        let victims = builder.take_eviction_victims(&mut map, &keep);
+
+        assert!(!victims.contains(&keep));
+        assert!(map.contains_key(&keep));
+    }
+
+    // After a held victim is skipped, the next prepare finds it recorded and on
+    // disk, so it reuses the directory instead of clearing it as a stale leftover.
+    #[test]
+    fn test_evict_skipped_victim_directory_is_reused_not_recreated() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_dist_evict_reuse")
+            .tempdir()
+            .unwrap();
+        let builder = builder_with_toolchain_dirs(tempdir.path(), &["old1", "mid1"]);
+        let (keep, old, _) = evict_fixture(&builder);
+        let old_dir = builder.dir.join("toolchains").join("old1");
+        fs::write(old_dir.join("marker"), b"x").unwrap();
+        let lock = get_toolchain_lock(&builder.toolchain_prepare_locks, &old);
+        let held = lock.lock().unwrap();
+        {
+            let mut map = builder.toolchain_dir_map.lock().unwrap();
+            builder.take_eviction_victims(&mut map, &keep);
+        }
+        drop(held);
+
+        let entry = builder.bump_prepared_toolchain(&old, &old_dir);
+
+        assert!(entry.is_some(), "the skipped victim is still prepared");
+        assert!(old_dir.join("marker").exists());
     }
 }
