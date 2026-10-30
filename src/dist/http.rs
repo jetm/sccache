@@ -436,6 +436,7 @@ mod server {
     pub enum RouilleBincodeError {
         BodyAlreadyExtracted,
         WrongContentType,
+        TooLarge,
         ParseError(bincode::Error),
     }
     impl From<bincode::Error> for RouilleBincodeError {
@@ -466,27 +467,108 @@ mod server {
                     RouilleBincodeError::WrongContentType => {
                         "the request didn't have a binary content type"
                     }
+                    RouilleBincodeError::TooLarge => "the request body is too large",
                     RouilleBincodeError::ParseError(_) => "error while parsing the bincode body",
                 }
             )
+        }
+    }
+    fn check_octet_stream(
+        request: &rouille::Request,
+    ) -> std::result::Result<(), RouilleBincodeError> {
+        match request.header("Content-Type") {
+            Some(header) if header.starts_with("application/octet-stream") => Ok(()),
+            _ => Err(RouilleBincodeError::WrongContentType),
         }
     }
     fn bincode_input<O>(request: &rouille::Request) -> std::result::Result<O, RouilleBincodeError>
     where
         O: serde::de::DeserializeOwned,
     {
-        if let Some(header) = request.header("Content-Type") {
-            if !header.starts_with("application/octet-stream") {
-                return Err(RouilleBincodeError::WrongContentType);
-            }
-        } else {
-            return Err(RouilleBincodeError::WrongContentType);
-        }
+        check_octet_stream(request)?;
 
         if let Some(mut b) = request.data() {
             bincode::deserialize_from::<_, O>(&mut b).map_err(From::from)
         } else {
             Err(RouilleBincodeError::BodyAlreadyExtracted)
+        }
+    }
+
+    // A heartbeat carries a cert and the active job list; 1 MiB is far above
+    // any real one and bounds what a hostile sender can make us buffer.
+    const MAX_HEARTBEAT_BODY: usize = 1024 * 1024;
+
+    // The heartbeat as servers sent it before the active-jobs report.
+    #[derive(Deserialize)]
+    struct HeartbeatBeforeActiveJobs {
+        jwt_key: Vec<u8>,
+        num_cpus: usize,
+        server_nonce: dist::ServerNonce,
+        cert_digest: Vec<u8>,
+        cert_pem: Vec<u8>,
+    }
+
+    // `active_jobs` is None when the server predates the report.
+    struct HeartbeatBody {
+        jwt_key: Vec<u8>,
+        num_cpus: usize,
+        server_nonce: dist::ServerNonce,
+        cert_digest: Vec<u8>,
+        cert_pem: Vec<u8>,
+        active_jobs: Option<Vec<JobId>>,
+    }
+
+    // Both layouts are decoded from the same buffered bytes, so a body is
+    // accepted only if exactly one layout consumes all of it. The free
+    // bincode functions ignore leftover bytes, which would let a current body
+    // pass as the older layout and drop its job list.
+    fn decode_heartbeat_body<R: Read>(
+        body: R,
+    ) -> std::result::Result<HeartbeatBody, RouilleBincodeError> {
+        use bincode::Options;
+
+        let mut bytes = Vec::new();
+        body.take(MAX_HEARTBEAT_BODY as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| RouilleBincodeError::ParseError(Box::new(bincode::ErrorKind::Io(e))))?;
+        if bytes.len() > MAX_HEARTBEAT_BODY {
+            return Err(RouilleBincodeError::TooLarge);
+        }
+        let opts = || {
+            bincode::options()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+        };
+        match opts().deserialize::<HeartbeatServerHttpRequest>(&bytes) {
+            Ok(h) => Ok(HeartbeatBody {
+                jwt_key: h.jwt_key,
+                num_cpus: h.num_cpus,
+                server_nonce: h.server_nonce,
+                cert_digest: h.cert_digest,
+                cert_pem: h.cert_pem,
+                active_jobs: Some(h.active_jobs),
+            }),
+            Err(_) => {
+                let h = opts().deserialize::<HeartbeatBeforeActiveJobs>(&bytes)?;
+                Ok(HeartbeatBody {
+                    jwt_key: h.jwt_key,
+                    num_cpus: h.num_cpus,
+                    server_nonce: h.server_nonce,
+                    cert_digest: h.cert_digest,
+                    cert_pem: h.cert_pem,
+                    active_jobs: None,
+                })
+            }
+        }
+    }
+
+    fn heartbeat_input(
+        request: &rouille::Request,
+    ) -> std::result::Result<HeartbeatBody, RouilleBincodeError> {
+        check_octet_stream(request)?;
+        match request.data() {
+            Some(b) => decode_heartbeat_body(b),
+            None => Err(RouilleBincodeError::BodyAlreadyExtracted),
         }
     }
 
@@ -842,10 +924,10 @@ mod server {
                     },
                     (POST) (/api/v1/scheduler/heartbeat_server) => {
                         let server_id = check_server_auth_or_err!(request);
-                        let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
-                        trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
+                        let heartbeat_server = try_or_400_log!(req_id, heartbeat_input(request));
+                        trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: active_jobs={:?}", req_id, heartbeat_server.active_jobs);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem, active_jobs } = heartbeat_server;
+                        let HeartbeatBody { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem, active_jobs } = heartbeat_server;
                         try_or_500_log!(req_id, maybe_update_certs(
                             &mut requester.client.lock().unwrap(),
                             &mut server_certificates.lock().unwrap(),
@@ -856,7 +938,7 @@ mod server {
                             server_id, server_nonce,
                             num_cpus,
                             job_authorizer,
-                            Some(active_jobs)
+                            active_jobs
                         ));
                         prepare_response(request, &res)
                     },
@@ -1186,6 +1268,254 @@ mod server {
                     .bincode(&state)?,
             )
             .context("POST to scheduler job_state failed")
+        }
+    }
+
+    #[cfg(test)]
+    mod heartbeat_tests {
+        use super::*;
+        use crate::dist::{
+            AllocJobResult, DeregisterServerResult, JobAuthorizer, SchedulerIncoming,
+            SchedulerOutgoing, SchedulerStatusResult, UpdateJobStateResult,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The request as servers sent it before the active-jobs report.
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct OldHeartbeat {
+            jwt_key: Vec<u8>,
+            num_cpus: usize,
+            server_nonce: dist::ServerNonce,
+            cert_digest: Vec<u8>,
+            cert_pem: Vec<u8>,
+        }
+
+        fn old_heartbeat() -> OldHeartbeat {
+            OldHeartbeat {
+                jwt_key: vec![1, 2, 3],
+                num_cpus: 8,
+                server_nonce: dist::ServerNonce::new(),
+                cert_digest: vec![4, 5],
+                cert_pem: vec![6, 7, 8, 9],
+            }
+        }
+
+        fn current_heartbeat(jobs: Vec<JobId>) -> HeartbeatServerHttpRequest {
+            let old = old_heartbeat();
+            HeartbeatServerHttpRequest {
+                jwt_key: old.jwt_key,
+                num_cpus: old.num_cpus,
+                server_nonce: old.server_nonce,
+                cert_digest: old.cert_digest,
+                cert_pem: old.cert_pem,
+                active_jobs: jobs,
+            }
+        }
+
+        #[test]
+        fn heartbeat_five_field_body_has_no_active_jobs() {
+            let old = old_heartbeat();
+            let body = bincode::serialize(&old).unwrap();
+            let got = decode_heartbeat_body(&body[..]).unwrap();
+            assert_eq!(got.active_jobs, None);
+            assert_eq!(got.num_cpus, old.num_cpus);
+            assert_eq!(got.jwt_key, old.jwt_key);
+            assert_eq!(got.server_nonce, old.server_nonce);
+            assert_eq!(got.cert_digest, old.cert_digest);
+            assert_eq!(got.cert_pem, old.cert_pem);
+        }
+
+        #[test]
+        fn heartbeat_current_body_keeps_its_active_jobs() {
+            let jobs = vec![JobId(3), JobId(9)];
+            let body = bincode::serialize(&current_heartbeat(jobs.clone())).unwrap();
+            let got = decode_heartbeat_body(&body[..]).unwrap();
+            assert_eq!(got.active_jobs, Some(jobs));
+        }
+
+        #[test]
+        fn heartbeat_current_body_decodes_in_older_layout() {
+            let body = bincode::serialize(&current_heartbeat(vec![JobId(3)])).unwrap();
+            let got: OldHeartbeat = bincode::deserialize_from(&body[..]).unwrap();
+            assert_eq!(got, old_heartbeat_with(&got));
+        }
+
+        // Only the nonce is random, so compare everything else through it.
+        fn old_heartbeat_with(got: &OldHeartbeat) -> OldHeartbeat {
+            OldHeartbeat {
+                server_nonce: got.server_nonce.clone(),
+                ..old_heartbeat()
+            }
+        }
+
+        #[test]
+        fn heartbeat_truncated_current_body_is_rejected() {
+            let body = bincode::serialize(&current_heartbeat(vec![JobId(3), JobId(4)])).unwrap();
+            let cut = &body[..body.len() - 3];
+            assert!(matches!(
+                decode_heartbeat_body(cut),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        #[test]
+        fn heartbeat_five_field_body_with_trailing_byte_is_rejected() {
+            let mut body = bincode::serialize(&old_heartbeat()).unwrap();
+            body.push(0);
+            assert!(matches!(
+                decode_heartbeat_body(&body[..]),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        #[test]
+        fn heartbeat_current_body_with_trailing_byte_is_rejected() {
+            let mut body = bincode::serialize(&current_heartbeat(vec![JobId(3)])).unwrap();
+            body.push(0);
+            assert!(matches!(
+                decode_heartbeat_body(&body[..]),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        struct CountingRead(Arc<AtomicUsize>);
+        impl Read for CountingRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(buf.len(), Ordering::SeqCst);
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+
+        #[test]
+        fn heartbeat_oversized_body_is_rejected_without_reading_past_the_cap() {
+            let handed_out = Arc::new(AtomicUsize::new(0));
+            let res = decode_heartbeat_body(CountingRead(Arc::clone(&handed_out)));
+            assert!(matches!(res, Err(RouilleBincodeError::TooLarge)));
+            // `Read::take` caps what is requested from the source, not just
+            // what the decoder keeps.
+            assert!(handed_out.load(Ordering::SeqCst) <= MAX_HEARTBEAT_BODY + 1);
+        }
+
+        type Registered = Arc<Mutex<HashMap<ServerId, (usize, Option<Vec<JobId>>)>>>;
+
+        struct RecordingScheduler(Registered);
+        impl SchedulerIncoming for RecordingScheduler {
+            fn handle_alloc_job(
+                &self,
+                _: &dyn SchedulerOutgoing,
+                _: dist::Toolchain,
+            ) -> Result<AllocJobResult> {
+                unimplemented!()
+            }
+            fn handle_heartbeat_server(
+                &self,
+                server_id: ServerId,
+                _: dist::ServerNonce,
+                num_cpus: usize,
+                _: Box<dyn JobAuthorizer>,
+                active_jobs: Option<Vec<JobId>>,
+            ) -> Result<HeartbeatServerResult> {
+                let is_new = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert(server_id, (num_cpus, active_jobs))
+                    .is_none();
+                Ok(HeartbeatServerResult { is_new })
+            }
+            fn handle_deregister_server(&self, _: ServerId) -> Result<DeregisterServerResult> {
+                unimplemented!()
+            }
+            fn handle_update_job_state(
+                &self,
+                _: JobId,
+                _: ServerId,
+                _: dist::JobState,
+            ) -> Result<UpdateJobStateResult> {
+                unimplemented!()
+            }
+            fn handle_status(&self) -> Result<SchedulerStatusResult> {
+                unimplemented!()
+            }
+        }
+
+        struct AllowAll;
+        impl ClientAuthCheck for AllowAll {
+            fn check(&self, _: &str) -> StdResult<(), ClientVisibleMsg> {
+                Ok(())
+            }
+        }
+
+        fn self_signed_pem() -> Vec<u8> {
+            use openssl::asn1::Asn1Time;
+            use openssl::hash::MessageDigest;
+            use openssl::pkey::PKey;
+            use openssl::rsa::Rsa;
+            use openssl::x509::{X509, X509NameBuilder};
+
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "heartbeat-test").unwrap();
+            let name = name.build();
+            let mut b = X509::builder().unwrap();
+            b.set_version(2).unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(&name).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+                .unwrap();
+            b.sign(&key, MessageDigest::sha256()).unwrap();
+            b.build().to_pem().unwrap()
+        }
+
+        #[test]
+        fn heartbeat_route_registers_a_five_field_body() {
+            let registered: Registered = Default::default();
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let server_id = ServerId::new(SocketAddr::from(([127, 0, 0, 1], 9999)));
+            let scheduler = Scheduler::new(
+                addr,
+                RecordingScheduler(Arc::clone(&registered)),
+                Box::new(AllowAll),
+                Box::new(move |_| Some(server_id)),
+            );
+            // start() never returns, so the thread is left to die with the
+            // test process.
+            thread::spawn(move || scheduler.start());
+
+            let mut old = old_heartbeat();
+            old.cert_pem = self_signed_pem();
+            let body = bincode::serialize(&old).unwrap();
+            let client = reqwest::blocking::Client::new();
+            let url = format!("http://{addr}/api/v1/scheduler/heartbeat_server");
+            let mut status = None;
+            for _ in 0..100 {
+                match client
+                    .post(&url)
+                    .bearer_auth("token")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Accept", "application/octet-stream")
+                    .body(body.clone())
+                    .send()
+                {
+                    Ok(resp) => {
+                        status = Some(resp.status());
+                        break;
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            assert_eq!(status, Some(reqwest::StatusCode::OK));
+            let registered = registered.lock().unwrap();
+            assert_eq!(registered.get(&server_id), Some(&(old.num_cpus, None)));
         }
     }
 }
