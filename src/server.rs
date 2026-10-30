@@ -1723,6 +1723,16 @@ where
                                 res.retcode = Some(1);
                                 res.stderr = errmsg.as_bytes().to_vec();
                             }
+                            // Reported to the build as a plain failure: the cache is
+                            // healthy and the dist client needs no reset.
+                            Err(err) if err.downcast_ref::<DistOutputMissing>().is_some() => {
+                                // Make sure the write guard has been dropped ASAP.
+                                drop(stats);
+                                let errmsg = format!("[{:?}] {}", out_pretty, err);
+                                error!("{}", errmsg);
+                                res.retcode = Some(1);
+                                res.stderr = errmsg.as_bytes().to_vec();
+                            }
                             Err(err) => {
                                 stats.cache_errors.increment(&kind, &lang);
                                 // Make sure the write guard has been dropped ASAP.

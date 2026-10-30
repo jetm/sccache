@@ -906,22 +906,6 @@ impl Drop for InflightGuard {
     }
 }
 
-/// A distributed compile succeeded without returning a declared output while the
-/// `[dist] fallback` switch is off, so it is reported instead of recompiled.
-#[cfg(feature = "dist-client")]
-#[derive(Debug)]
-pub(crate) struct DistOutputMissing(pub String);
-
-#[cfg(feature = "dist-client")]
-impl std::error::Error for DistOutputMissing {}
-
-#[cfg(feature = "dist-client")]
-impl fmt::Display for DistOutputMissing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 #[cfg(feature = "dist-client")]
 async fn dist_or_local_compile<T>(
     service: &server::SccacheService<T>,
