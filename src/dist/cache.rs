@@ -621,6 +621,11 @@ impl TcCache {
         self.inner.path()
     }
 
+    /// A temporary file in the cache root that a restarted cache discards.
+    pub fn new_tempfile(&self) -> Result<tempfile::NamedTempFile> {
+        Ok(self.inner.new_tempfile()?)
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }

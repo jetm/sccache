@@ -1357,19 +1357,19 @@ fn receive_toolchain(
     tc: &Toolchain,
     tc_rdr: &mut dyn io::Read,
 ) -> SubmitToolchainResult {
-    // Skip the transfer entirely if the toolchain is already cached. Grab the cache
-    // directory while we hold the lock so the temp file lands on the same
-    // filesystem and the final insert is a rename.
-    let tc_cache_dir = {
+    // Skip the transfer entirely if the toolchain is already cached. Create the
+    // temp file while we hold the lock; it lands in the cache root so the final
+    // insert is a rename.
+    let mut tmpfile = {
         let cache = cache.lock().unwrap();
         // TODO: this returns before reading all the data, is that valid?
         if cache.contains_toolchain(tc) {
             return SubmitToolchainResult::Success;
         }
-        cache.path().to_path_buf()
-    };
-    let Ok(mut tmpfile) = tempfile::NamedTempFile::new_in(&tc_cache_dir) else {
-        return SubmitToolchainResult::CannotCache;
+        match cache.new_tempfile() {
+            Ok(f) => f,
+            Err(_) => return SubmitToolchainResult::CannotCache,
+        }
     };
     // Hash while copying so verification costs no lock and no second read, and a
     // forged upload is dropped before it can evict anything.
@@ -2738,6 +2738,64 @@ mod scheduler_tests {
             SubmitToolchainResult::Success
         ));
         assert!(cache.lock().unwrap().contains_toolchain(&tc));
+    }
+
+    /// Yields `first` once, then signals and blocks until released.
+    struct StallingReader {
+        first: Option<Vec<u8>>,
+        stalled: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl io::Read for StallingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(first) = self.first.take() {
+                buf[..first.len()].copy_from_slice(&first);
+                return Ok(first.len());
+            }
+            if let Some(stalled) = self.stalled.take() {
+                stalled.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(0)
+        }
+    }
+
+    // A server restarted after dying mid-upload must not adopt the partial file
+    // as a cache entry, or it would hold bytes no toolchain id maps to.
+    #[test]
+    fn test_receive_toolchain_interrupted_upload_is_not_adopted_on_restart() {
+        let tc = toolchain_of(b"the full toolchain");
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Mutex::new(TcCache::new(cache_dir.path(), u64::MAX).unwrap());
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let upload = scope.spawn(|| {
+                let mut rdr = StallingReader {
+                    first: Some(b"partial".to_vec()),
+                    stalled: Some(stalled_tx),
+                    release: release_rx,
+                };
+                receive_toolchain(&cache, &tc, &mut rdr)
+            });
+            stalled_rx.recv().unwrap();
+
+            let restarted = TcCache::new(cache_dir.path(), u64::MAX).unwrap();
+            let entries = restarted.len();
+            let leftover = std::fs::read_dir(cache_dir.path()).unwrap().count();
+
+            // Release before asserting so a failure cannot leave the scope
+            // joining a thread that is still blocked.
+            release_tx.send(()).unwrap();
+            assert!(matches!(
+                upload.join().unwrap(),
+                SubmitToolchainResult::CannotCache
+            ));
+            assert_eq!(entries, 0, "partial upload adopted as an entry");
+            assert_eq!(leftover, 0, "partial upload file survived the restart scan");
+        });
     }
 
     struct LockProbeReader<'a> {

@@ -177,6 +177,15 @@ impl LruDiskCache {
         self.root.as_path()
     }
 
+    /// Create a temporary file in the cache root that the startup scan removes,
+    /// so an upload interrupted by a crash is never adopted as an entry.
+    pub fn new_tempfile(&self) -> Result<NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(TEMPFILE_PREFIX)
+            .tempfile_in(&self.root)
+            .map_err(Into::into)
+    }
+
     /// Return the path that `key` would be stored at.
     fn rel_to_abs_path<K: AsRef<Path>>(&self, rel_path: K) -> PathBuf {
         self.root.join(rel_path)
