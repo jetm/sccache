@@ -4367,7 +4367,11 @@ LLVM version: 6.0",
             "unexpected error: {:#}",
             err
         );
-        assert!(err.to_string().contains("foo.o"), "{:#}", err);
+        // The outer context only names the object being stored; the error itself
+        // must name the output the server did not return.
+        let missing = err.downcast_ref::<DistOutputMissing>().unwrap();
+        assert!(missing.0.contains("foo.o"), "{:#}", err);
+        assert!(format!("{:#}", err).contains(&missing.0), "{:#}", err);
         assert!(!recompiled);
         assert_eq!(0, cached, "nothing may be stored in the compile cache");
     }

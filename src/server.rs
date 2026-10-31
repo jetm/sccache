@@ -1728,7 +1728,9 @@ where
                             Err(err) if err.downcast_ref::<DistOutputMissing>().is_some() => {
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
-                                let errmsg = format!("[{:?}] {}", out_pretty, err);
+                                // `{:#}`: the outer context names only the object being
+                                // stored; the missing output is the root message.
+                                let errmsg = format!("[{:?}] {:#}", out_pretty, err);
                                 error!("{}", errmsg);
                                 res.retcode = Some(1);
                                 res.stderr = errmsg.as_bytes().to_vec();

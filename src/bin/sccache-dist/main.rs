@@ -1380,7 +1380,12 @@ fn receive_toolchain(
     if io::copy(&mut hashing, tmpfile.as_file_mut()).is_err() {
         return SubmitToolchainResult::CannotCache;
     }
-    if hashing.digest.finish() != tc.archive_id {
+    let digest = hashing.digest.finish();
+    if digest != tc.archive_id {
+        warn!(
+            "Rejected toolchain upload for {}: content hashes to {}",
+            tc.archive_id, digest
+        );
         return SubmitToolchainResult::CannotCache;
     }
     let temp_path = tmpfile.into_temp_path();
