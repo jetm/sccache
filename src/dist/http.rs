@@ -1100,10 +1100,6 @@ mod server {
             install_shutdown_handler();
             thread::spawn(move || {
                 let client = reqwest::blocking::Client::builder()
-                    // Keep a small idle pool with a sub-LAN-limit idle timeout
-                    // so keep-alive connections are reused, not rebuilt.
-                    .pool_max_idle_per_host(2)
-                    .pool_idle_timeout(Duration::from_secs(90))
                     // Bounds connect + request: a stop must not hang on a
                     // scheduler that is down, systemd's stop timeout is longer.
                     .timeout(Duration::from_secs(2))

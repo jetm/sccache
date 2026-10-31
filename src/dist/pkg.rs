@@ -74,6 +74,20 @@ mod toolchain_imp {
 
     use crate::errors::*;
 
+    /// Whether a directory entry belongs in a best-effort package: a regular
+    /// file, or a symlink that resolves to one. A dangling symlink (e.g. a
+    /// sysroot-relative link that resolves outside the packaged tree, like an OE
+    /// recipe-sysroot-native `usr/bin/sg`) makes metadata fail, so it is skipped
+    /// rather than aborting the whole package. add_file resolves a symlink and
+    /// tarify_path records the link.
+    fn is_packable_file(path: &Path, file_type: std::fs::FileType) -> bool {
+        if file_type.is_symlink() {
+            fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+        } else {
+            file_type.is_file()
+        }
+    }
+
     pub struct ToolchainPackageBuilder {
         // Put dirs and file in a deterministic order (map from tar_path -> real_path)
         dir_set: BTreeMap<PathBuf, PathBuf>,
@@ -186,23 +200,7 @@ mod toolchain_imp {
             // best-effort auto packaging
             for entry in WalkDir::new(dir_path).follow_links(false) {
                 let entry = entry?;
-                let file_type = entry.file_type();
-                if file_type.is_dir() {
-                    continue;
-                } else if file_type.is_symlink() {
-                    // A dangling symlink (e.g. a sysroot-relative link that
-                    // resolves outside the packaged tree, like an OE
-                    // recipe-sysroot-native `usr/bin/sg`) makes metadata fail.
-                    // Skip it rather than aborting the whole best-effort
-                    // package, matching add_shared_libraries below.
-                    if !fs::metadata(entry.path())
-                        .map(|m| m.is_file())
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                } else if !file_type.is_file() {
-                    // Device or other oddity
+                if !is_packable_file(entry.path(), entry.file_type()) {
                     continue;
                 }
                 trace!("walkdir add_file {}", entry.path().display());
@@ -230,17 +228,7 @@ mod toolchain_imp {
                 if !(name.ends_with(".so") || name.contains(".so.")) {
                     continue;
                 }
-                let file_type = entry.file_type()?;
-                if file_type.is_symlink() {
-                    // A symlink pointing at a regular file; add_file resolves it
-                    // and tarify_path records the link.
-                    if !fs::metadata(entry.path())
-                        .map(|m| m.is_file())
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                } else if !file_type.is_file() {
+                if !is_packable_file(&entry.path(), entry.file_type()?) {
                     continue;
                 }
                 trace!("shared lib add_file {}", entry.path().display());
