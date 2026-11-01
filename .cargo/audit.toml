@@ -1,0 +1,11 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa 0.9.10, Marvin Attack timing side channel.
+    # Reason: no fixed release exists. The crate is compiled in only through
+    # the request-signing crates (reqsign) of the object-storage layer, and
+    # this cluster's cache is local disk (`sccache --show-stats` prints
+    # "Cache location Local disk"), so no RSA private-key operation runs.
+    # Ceiling: valid only while no cloud storage backend is configured with an RSA key.
+    # Upgrade trigger: a fixed rsa release is published, or any host configures a cloud storage backend.
+    "RUSTSEC-2023-0071",
+]
