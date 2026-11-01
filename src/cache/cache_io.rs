@@ -18,7 +18,7 @@ use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 /// Cache object sourced by a file.
@@ -271,7 +271,7 @@ impl CacheWrite {
     {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
-        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         let opts = if let Some(mode) = mode {
             opts.unix_permissions(mode)
         } else {
@@ -307,7 +307,7 @@ impl CacheWrite {
 
     /// Finish writing data to the cache entry writer, and return the data.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { mut zip } = self;
+        let CacheWrite { zip } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }
@@ -472,5 +472,53 @@ mod tests {
 
         let result = runtime.block_on(cache_read.extract_objects(objects, pool));
         assert!(result.is_ok(), "Extracting to NUL should succeed");
+    }
+
+    fn assert_entry_contents(bytes: Vec<u8>) {
+        let mut read = CacheRead::from(Cursor::new(bytes)).unwrap();
+        let mut obj = Vec::new();
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let mode = read.get_object("obj", &mut obj).unwrap();
+        assert_eq!(obj, b"object bytes");
+        #[cfg(unix)]
+        assert_eq!(mode.map(|m| m & 0o777), Some(0o755));
+        assert_eq!(read.get_stdout(), b"out");
+        assert_eq!(read.get_stderr(), b"err");
+    }
+
+    #[test]
+    fn test_cache_entry_round_trips_objects_stdout_stderr_and_mode() {
+        let mut w = CacheWrite::new();
+        w.put_object(
+            "obj",
+            &mut Cursor::new(b"object bytes".to_vec()),
+            Some(0o755),
+        )
+        .unwrap();
+        w.put_stdout(b"out").unwrap();
+        w.put_stderr(b"err").unwrap();
+        assert_entry_contents(w.finish().unwrap());
+    }
+
+    #[test]
+    fn test_cache_entry_written_before_the_zip_9_port_is_readable() {
+        // Produced by CacheWrite at base commit 1dc02e81 (zip 0.6).
+        const FIXTURE: &[u8] = &[
+            80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 183, 120, 88, 76, 21, 0, 0, 0, 21, 0, 0,
+            0, 3, 0, 0, 0, 111, 98, 106, 40, 181, 47, 253, 0, 88, 97, 0, 0, 111, 98, 106, 101, 99,
+            116, 32, 98, 121, 116, 101, 115, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 48, 133,
+            147, 224, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 111, 117, 116, 40, 181,
+            47, 253, 0, 88, 25, 0, 0, 111, 117, 116, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0,
+            20, 51, 38, 75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 101, 114, 114, 40,
+            181, 47, 253, 0, 88, 25, 0, 0, 101, 114, 114, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0,
+            0, 0, 33, 0, 183, 120, 88, 76, 21, 0, 0, 0, 21, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 237, 129, 0, 0, 0, 0, 111, 98, 106, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0, 0, 0,
+            33, 0, 48, 133, 147, 224, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            164, 129, 54, 0, 0, 0, 115, 116, 100, 111, 117, 116, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0,
+            0, 0, 0, 0, 33, 0, 20, 51, 38, 75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 164, 129, 102, 0, 0, 0, 115, 116, 100, 101, 114, 114, 80, 75, 5, 6, 0, 0, 0,
+            0, 3, 0, 3, 0, 153, 0, 0, 0, 150, 0, 0, 0, 0, 0,
+        ];
+        assert_entry_contents(FIXTURE.to_vec());
     }
 }
