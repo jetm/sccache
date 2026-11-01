@@ -500,25 +500,81 @@ mod tests {
         assert_entry_contents(w.finish().unwrap());
     }
 
+    // Produced by CacheWrite at base commit 1dc02e81 (zip 0.6).
+    const FIXTURE: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 183, 120, 88, 76, 21, 0, 0, 0, 21, 0, 0, 0,
+        3, 0, 0, 0, 111, 98, 106, 40, 181, 47, 253, 0, 88, 97, 0, 0, 111, 98, 106, 101, 99, 116,
+        32, 98, 121, 116, 101, 115, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 48, 133, 147,
+        224, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 111, 117, 116, 40, 181, 47, 253,
+        0, 88, 25, 0, 0, 111, 117, 116, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 20, 51, 38,
+        75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 101, 114, 114, 40, 181, 47, 253,
+        0, 88, 25, 0, 0, 101, 114, 114, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 183,
+        120, 88, 76, 21, 0, 0, 0, 21, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 237, 129, 0, 0,
+        0, 0, 111, 98, 106, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 48, 133, 147, 224,
+        12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 164, 129, 54, 0, 0, 0, 115,
+        116, 100, 111, 117, 116, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 20, 51, 38,
+        75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 164, 129, 102, 0, 0, 0,
+        115, 116, 100, 101, 114, 114, 80, 75, 5, 6, 0, 0, 0, 0, 3, 0, 3, 0, 153, 0, 0, 0, 150, 0,
+        0, 0, 0, 0,
+    ];
+
     #[test]
     fn test_cache_entry_written_before_the_zip_9_port_is_readable() {
-        // Produced by CacheWrite at base commit 1dc02e81 (zip 0.6).
-        const FIXTURE: &[u8] = &[
-            80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 183, 120, 88, 76, 21, 0, 0, 0, 21, 0, 0,
-            0, 3, 0, 0, 0, 111, 98, 106, 40, 181, 47, 253, 0, 88, 97, 0, 0, 111, 98, 106, 101, 99,
-            116, 32, 98, 121, 116, 101, 115, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 48, 133,
-            147, 224, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 111, 117, 116, 40, 181,
-            47, 253, 0, 88, 25, 0, 0, 111, 117, 116, 80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0,
-            20, 51, 38, 75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 115, 116, 100, 101, 114, 114, 40,
-            181, 47, 253, 0, 88, 25, 0, 0, 101, 114, 114, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0,
-            0, 0, 33, 0, 183, 120, 88, 76, 21, 0, 0, 0, 21, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 237, 129, 0, 0, 0, 0, 111, 98, 106, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0, 0, 0, 0, 0,
-            33, 0, 48, 133, 147, 224, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            164, 129, 54, 0, 0, 0, 115, 116, 100, 111, 117, 116, 80, 75, 1, 2, 46, 3, 20, 0, 0, 0,
-            0, 0, 0, 0, 33, 0, 20, 51, 38, 75, 12, 0, 0, 0, 12, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 164, 129, 102, 0, 0, 0, 115, 116, 100, 101, 114, 114, 80, 75, 5, 6, 0, 0, 0,
-            0, 3, 0, 3, 0, 153, 0, 0, 0, 150, 0, 0, 0, 0, 0,
-        ];
         assert_entry_contents(FIXTURE.to_vec());
+    }
+
+    #[test]
+    fn test_cache_entry_writer_output_matches_the_zip_0_6_bytes() {
+        // A reader of the previous package (zip 0.6) must accept what this writer emits, so pin the
+        // bytes: stored method, host byte 3, unix modes in the external attributes, no extra fields.
+        // zip 9 differs from zip 0.6 only in the "version needed to extract" and "version made by"
+        // fields, which it sets to 1.0 for a stored entry where zip 0.6 set 2.0 (and 4.6 made-by).
+        // The previous package reads them without checking, which the cross-binary check confirms.
+        const VERSION_BYTES: [(usize, u8); 9] = [
+            (4, 10),
+            (58, 10),
+            (106, 10),
+            (154, 10),
+            (156, 10),
+            (203, 10),
+            (205, 10),
+            (255, 10),
+            (257, 10),
+        ];
+        let mut expected = FIXTURE.to_vec();
+        for (at, value) in VERSION_BYTES {
+            expected[at] = value;
+        }
+        let mut w = CacheWrite::new();
+        w.put_object(
+            "obj",
+            &mut Cursor::new(b"object bytes".to_vec()),
+            Some(0o755),
+        )
+        .unwrap();
+        w.put_stdout(b"out").unwrap();
+        w.put_stderr(b"err").unwrap();
+        assert_eq!(w.finish().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_cache_entry_with_a_damaged_zstd_frame_fails_with_decompression_failure() {
+        // The first zstd magic in the entry is the start of the "obj" frame.
+        const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+        let mut bytes = FIXTURE.to_vec();
+        let at = bytes.windows(4).position(|w| w == ZSTD_MAGIC).unwrap();
+        bytes[at] ^= 0xff;
+        let mut read = CacheRead::from(Cursor::new(bytes)).unwrap();
+        let err = read.get_object("obj", &mut Vec::new()).unwrap_err();
+        assert!(
+            err.downcast_ref::<DecompressionFailure>().is_some(),
+            "expected DecompressionFailure, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_truncated_cache_entry_is_rejected() {
+        let truncated = FIXTURE[..FIXTURE.len() - 10].to_vec();
+        assert!(CacheRead::from(Cursor::new(truncated)).is_err());
     }
 }
