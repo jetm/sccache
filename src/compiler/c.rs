@@ -694,13 +694,18 @@ where
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
 
+        // The preprocessed text of an `.incbin` holds only the path, so without the
+        // file's content in the key a changed file would be served the old object.
+        let mut key_extra_hashes = extra_hashes;
+        key_extra_hashes.extend(incbin_digests(&preprocessor_output, &cwd, pool).await);
+
         let key = HashKeyParams::new(
             &self.executable_digest,
             self.parsed_args.language,
             &common_and_arch_args,
             &preprocessor_output,
         )
-        .with_extra_hashes(&extra_hashes)
+        .with_extra_hashes(&key_extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
         .with_basedirs(storage.basedirs())
@@ -771,6 +776,71 @@ const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
 const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
 const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
 const INCBIN_DIRECTIVE: &[u8] = b".incbin";
+
+/// The files named by `.incbin` directives in preprocessed assembly or in inline
+/// assembly, which the compiler embeds by path and the preprocessor never reads.
+///
+/// Inline assembly reaches the compiler as a C string literal, so the quotes
+/// around the path may be escaped (`.incbin \"path\"`). The result is sorted and
+/// holds each path once so that the key built from it does not depend on the
+/// order the directives appear in.
+fn incbin_paths(preprocessed: &[u8]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for at in memchr::memmem::find_iter(preprocessed, INCBIN_DIRECTIVE) {
+        let mut rest = &preprocessed[at + INCBIN_DIRECTIVE.len()..];
+        while let [b' ' | b'\t', tail @ ..] = rest {
+            rest = tail;
+        }
+        if let [b'\\', tail @ ..] = rest {
+            rest = tail;
+        }
+        let [b'"', path_and_tail @ ..] = rest else {
+            continue;
+        };
+        let Some(end) = path_and_tail.iter().position(|&b| b == b'"') else {
+            continue;
+        };
+        let mut path = &path_and_tail[..end];
+        if let [head @ .., b'\\'] = path {
+            path = head;
+        }
+        if !path.is_empty()
+            && let Ok(path) = decode_path(path)
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// One digest per file named by an `.incbin` directive, to be hashed into the
+/// cache key, since the preprocessed text only holds the path. A file that
+/// cannot be read yields a digest that never repeats, so such a compile is not
+/// served from the cache (and its result is not reused) rather than keyed on a
+/// path whose content is unknown.
+async fn incbin_digests(
+    preprocessed: &[u8],
+    cwd: &Path,
+    pool: &tokio::runtime::Handle,
+) -> Vec<String> {
+    let mut digests = Vec::new();
+    for path in incbin_paths(preprocessed) {
+        let absolute = cwd.join(&path);
+        match Digest::file(&absolute, pool).await {
+            Ok(digest) => digests.push(format!("incbin:{digest}")),
+            Err(e) => {
+                debug!("Cannot hash .incbin file {}: {}", absolute.display(), e);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                digests.push(format!("incbin-unreadable:{now}:{}", path.display()));
+            }
+        }
+    }
+    digests
+}
 
 /// Remember the include files in the preprocessor output if it can be cached.
 /// Returns `false` if preprocessor cache mode should be disabled.
@@ -2628,6 +2698,90 @@ int value;
                 .unwrap(),
             // hash of `b"contents"`
             "a93900c371d997927c5bc568ea538bed59ae5c960021dcfe7b0b369da5267528",
+        );
+    }
+
+    #[test]
+    fn test_incbin_paths_finds_assembly_directives() {
+        let src = b"# 1 \"piggy.S\"\n.section \".rodata..compressed\"\n\t.incbin \"arch/x86/boot/compressed/vmlinux.bin.zst\"\n.incbin\"certs/signing_key.x509\"\n";
+        assert_eq!(
+            incbin_paths(src),
+            vec![
+                PathBuf::from("arch/x86/boot/compressed/vmlinux.bin.zst"),
+                PathBuf::from("certs/signing_key.x509"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_incbin_paths_finds_directives_inside_c_string_asm() {
+        // Inline asm in C reaches the compiler as a string literal, so the quotes are escaped.
+        let src = b"asm(\".section .rodata\\n\" \".incbin \\\"kernel/config_data.gz\\\"\\n\");";
+        assert_eq!(
+            incbin_paths(src),
+            vec![PathBuf::from("kernel/config_data.gz")]
+        );
+    }
+
+    #[test]
+    fn test_incbin_paths_ignores_text_without_a_quoted_path() {
+        assert!(incbin_paths(b"int main(void) { return 0; }\n").is_empty());
+        assert!(incbin_paths(b".incbin_like_name foo\n").is_empty());
+        assert!(incbin_paths(b".incbin \"unterminated").is_empty());
+        assert!(incbin_paths(b".incbin\n").is_empty());
+    }
+
+    #[test]
+    fn test_incbin_paths_lists_each_path_once_in_sorted_order() {
+        let src = b".incbin \"b.bin\"\n.incbin \"a.bin\"\n.incbin \"b.bin\"\n";
+        assert_eq!(
+            incbin_paths(src),
+            vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]
+        );
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_incbin_digests_change_with_the_embedded_file_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = b".incbin \"blob\"\n";
+        let rt = test_runtime();
+        std::fs::write(dir.path().join("blob"), b"first").unwrap();
+        let first = rt.block_on(incbin_digests(src, dir.path(), rt.handle()));
+        std::fs::write(dir.path().join("blob"), b"second").unwrap();
+        let second = rt.block_on(incbin_digests(src, dir.path(), rt.handle()));
+        std::fs::write(dir.path().join("blob"), b"first").unwrap();
+        let first_again = rt.block_on(incbin_digests(src, dir.path(), rt.handle()));
+        assert_eq!(first.len(), 1);
+        assert_ne!(first, second);
+        assert_eq!(first, first_again);
+    }
+
+    #[test]
+    fn test_incbin_digests_of_a_missing_file_never_repeat() {
+        // An unreadable file cannot be hashed, so the key must not be reusable.
+        let dir = tempfile::tempdir().unwrap();
+        let src = b".incbin \"absent\"\n";
+        let rt = test_runtime();
+        let a = rt.block_on(incbin_digests(src, dir.path(), rt.handle()));
+        let b = rt.block_on(incbin_digests(src, dir.path(), rt.handle()));
+        assert_eq!(a.len(), 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_incbin_digests_are_empty_without_a_directive() {
+        let rt = test_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            rt.block_on(incbin_digests(b"int x;\n", dir.path(), rt.handle()))
+                .is_empty()
         );
     }
 }
