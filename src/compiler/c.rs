@@ -1035,20 +1035,51 @@ fn starts_asm_statement(bytes: &[u8], pos: usize) -> bool {
 ///
 /// `.include` names assembly source, so its contents have to be scanned in turn.
 /// That is the caller's job, since it is the one reading the files.
+///
+/// Comments are skipped: with `-frewrite-includes` they survive preprocessing, and
+/// the assembler never sees them. A kernel header comment that spells
+/// `.include <asm/nospec-branch.h>` would otherwise read as a directive with an
+/// operand we cannot identify and make nearly every kernel file uncacheable. A
+/// comment marker inside a string literal is not a comment, since inline assembly
+/// can carry one and a directive after it still has to be found.
 fn find_asm_dependencies(bytes: &[u8]) -> Vec<AsmDependency> {
     let mut dependencies = Vec::new();
-    let mut offset = 0;
-    while let Some(pos) = memchr::memchr(b'.', &bytes[offset..]) {
-        let start = offset + pos;
-        match asm_dependency_at(&bytes[start..]) {
-            // Resume past the operand, so a file name that itself contains
-            // ".incbin" or ".include" is not mistaken for another directive.
-            Some((dependency, spanned)) if starts_asm_statement(bytes, start) => {
-                dependencies.push(dependency);
-                offset = start + spanned;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // An escape never ends a string, so step over the character it escapes.
+            b'\\' if in_string => {
+                i += 2;
+                continue;
             }
-            _ => offset = start + 1,
+            // A line break ends a string too, so a stray quote in an assembly
+            // comment cannot hide comment markers on later lines.
+            b'"' | b'\n' if in_string => in_string = false,
+            b'"' => in_string = true,
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'*') => {
+                i = memchr::memmem::find(&bytes[i + 2..], b"*/")
+                    .map_or(bytes.len(), |end| i + 2 + end + 2);
+                continue;
+            }
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |end| i + end);
+                continue;
+            }
+            b'.' => {
+                if let Some((dependency, spanned)) =
+                    asm_dependency_at(&bytes[i..]).filter(|_| starts_asm_statement(bytes, i))
+                {
+                    dependencies.push(dependency);
+                    // Resume past the operand, so a file name that itself contains
+                    // ".incbin" or ".include" is not mistaken for another directive.
+                    i += spanned;
+                    continue;
+                }
+            }
+            _ => {}
         }
+        i += 1;
     }
     dependencies
 }
@@ -2696,6 +2727,62 @@ mod test {
         assert_eq!(
             asm_dependency("printf(\".include %s\\n\", path);\n"),
             Some(AsmDependency::Unparsable)
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_in_comment_is_ignored() {
+        // -frewrite-includes keeps comments, and the kernel's nospec-branch.h has
+        // one that spells an .include with a <...> operand. A comment reaches the
+        // assembler as nothing, so it names no file and must not stop caching.
+        assert!(
+            find_asm_dependencies(
+                b"/*\n * from C via asm(\".include <asm/nospec-branch.h>\") but no\n */\nint x;\n"
+            )
+            .is_empty()
+        );
+        assert!(find_asm_dependencies(b"int x; // .incbin \"blob.bin\"\n").is_empty());
+        assert!(find_asm_dependencies(b"/* .include \"a.s\" */ int x;\n").is_empty());
+    }
+
+    #[test]
+    fn test_asm_dependency_after_a_comment_is_still_found() {
+        assert_eq!(
+            find_asm_dependencies(b"/* .include <x> */\n\t.incbin \"blob.bin\"\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"// note\n\t.include \"a.s\"\n"),
+            vec![AsmDependency::Source(b"a.s".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_comment_marker_inside_string_is_not_a_comment() {
+        // Inline assembly can contain "/*" or "//" in a string. Treating it as the
+        // start of a comment would hide the directive after it and serve a stale
+        // object.
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"/* x \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"// x \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        // An escaped quote does not end the string, so the comment marker after it
+        // is still inside it.
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"\\\" /* \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_unterminated_comment_hides_nothing_before_it() {
+        assert_eq!(
+            find_asm_dependencies(b"\t.incbin \"blob.bin\"\n/* never closed .include <x>\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
         );
     }
 
