@@ -989,10 +989,9 @@ fn asm_dependency_at(slice: &[u8]) -> Option<(AsmDependency, usize)> {
     let (wrap, directive_len, after_directive): (fn(Vec<u8>) -> AsmDependency, _, _) =
         if let Some(rest) = slice.strip_prefix(INCBIN_DIRECTIVE) {
             (AsmDependency::Embedded, INCBIN_DIRECTIVE.len(), rest)
-        } else if let Some(rest) = slice.strip_prefix(INCLUDE_DIRECTIVE) {
-            (AsmDependency::Source, INCLUDE_DIRECTIVE.len(), rest)
         } else {
-            return None;
+            let rest = slice.strip_prefix(INCLUDE_DIRECTIVE)?;
+            (AsmDependency::Source, INCLUDE_DIRECTIVE.len(), rest)
         };
 
     Some(match parse_file_operand(after_directive)? {
