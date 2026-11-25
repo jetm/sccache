@@ -29,6 +29,11 @@ pub struct BadHttpStatusError(pub hyper::StatusCode);
 #[derive(Debug)]
 pub struct HttpClientError(pub String);
 
+/// A distributed compile succeeded without returning a declared output while the
+/// `[dist] fallback` switch is off, so it is reported instead of recompiled.
+#[derive(Debug)]
+pub struct DistOutputMissing(pub String);
+
 #[derive(Debug)]
 pub struct ProcessError(pub process::Output);
 
@@ -36,6 +41,8 @@ pub struct ProcessError(pub process::Output);
 impl std::error::Error for BadHttpStatusError {}
 
 impl std::error::Error for HttpClientError {}
+
+impl std::error::Error for DistOutputMissing {}
 
 impl std::error::Error for ProcessError {}
 
@@ -49,6 +56,12 @@ impl std::fmt::Display for BadHttpStatusError {
 impl std::fmt::Display for HttpClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "didn't get a successful HTTP status, got `{}`", self.0)
+    }
+}
+
+impl std::fmt::Display for DistOutputMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

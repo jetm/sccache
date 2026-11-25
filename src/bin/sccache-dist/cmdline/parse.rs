@@ -255,7 +255,7 @@ pub fn try_parse_from(
                 .get_one::<PathBuf>("config")
                 .expect("`config` is required");
             if let Some(config) = config::server::from_path(config_path)? {
-                Command::Server(config)
+                Command::Server(Box::new(config))
             } else {
                 bail!("Could not load config")
             }

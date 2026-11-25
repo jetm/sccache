@@ -582,12 +582,48 @@ impl TcCache {
         }
     }
 
+    /// Insert an already-materialized toolchain file into the cache by moving it
+    /// under `tc`'s key, then re-hash it to verify the key. The re-hash runs
+    /// under whatever lock the caller holds; callers that verified the content
+    /// themselves use `insert_verified_at` instead.
+    pub fn insert_at(&mut self, tc: &Toolchain, path: &Path) -> Result<()> {
+        self.inner
+            .insert_file(make_lru_key_path(&tc.archive_id), path)?;
+        let verified_archive_id = file_key(self.get(tc)?)?;
+        if verified_archive_id == tc.archive_id {
+            Ok(())
+        } else {
+            // The grafted file hashes to the wrong key; drop it so a poisoned
+            // entry cannot satisfy a later lookup under the expected key.
+            let _ = self.inner.remove(make_lru_key_path(&tc.archive_id));
+            Err(anyhow!("written file does not match expected hash key"))
+        }
+    }
+
+    /// Move a toolchain file whose content the caller already hashed to `tc`'s
+    /// key into the cache. Skips the re-hash so the cache lock covers only the
+    /// rename.
+    pub fn insert_verified_at(&mut self, tc: &Toolchain, path: &Path) -> Result<()> {
+        self.inner
+            .insert_file(make_lru_key_path(&tc.archive_id), path)?;
+        Ok(())
+    }
+
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {
         self.inner.get_file(make_lru_key_path(&tc.archive_id))
     }
 
     pub fn get(&mut self, tc: &Toolchain) -> LruResult<Box<dyn ReadSeek>> {
         self.inner.get(make_lru_key_path(&tc.archive_id))
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    /// A temporary file in the cache root that a restarted cache discards.
+    pub fn new_tempfile(&self) -> Result<tempfile::NamedTempFile> {
+        Ok(self.inner.new_tempfile()?)
     }
 
     pub fn len(&self) -> usize {

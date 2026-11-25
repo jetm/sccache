@@ -570,6 +570,14 @@ pub struct HeartbeatServerResult {
     pub is_new: bool,
 }
 
+// DeregisterServer
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeregisterServerResult {
+    pub success: bool,
+}
+
 // RunJob
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -591,6 +599,51 @@ pub struct JobComplete {
 #[serde(deny_unknown_fields)]
 pub struct SchedulerStatusResult {
     pub num_servers: usize,
+    pub num_cpus: usize,
+    pub in_progress: usize,
+    /// Per-server breakdown so a client can see how capacity and load are
+    /// distributed, not just the cluster aggregate.
+    pub servers: Vec<ServerStatusResult>,
+}
+
+impl SchedulerStatusResult {
+    /// The aggregate counts alone, for a caller that has not authenticated: the
+    /// per-server list names every build server's address.
+    pub fn without_server_list(mut self) -> Self {
+        self.servers.clear();
+        self
+    }
+
+    /// Decode a scheduler's bincode status response. A stock scheduler sends only
+    /// the three aggregate counts, and bincode is positional, so the per-server
+    /// list is missing from its payload rather than defaulted; accept that and
+    /// leave the list empty so a client with the breakdown still works against it.
+    pub fn from_bincode(bytes: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct AggregateOnly {
+            num_servers: usize,
+            num_cpus: usize,
+            in_progress: usize,
+        }
+        match bincode::deserialize::<SchedulerStatusResult>(bytes) {
+            Ok(status) => Ok(status),
+            Err(full_err) => bincode::deserialize::<AggregateOnly>(bytes)
+                .map(|agg| SchedulerStatusResult {
+                    num_servers: agg.num_servers,
+                    num_cpus: agg.num_cpus,
+                    in_progress: agg.in_progress,
+                    servers: vec![],
+                })
+                .map_err(|_| full_err.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerStatusResult {
+    /// The server's socket address, as the scheduler knows it.
+    pub id: String,
     pub num_cpus: usize,
     pub in_progress: usize,
 }
@@ -678,7 +731,15 @@ pub trait SchedulerIncoming: Send + Sync {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
+        // None: the server predates the active-jobs report, so its heartbeat
+        // says nothing about which jobs are still running.
+        active_jobs: Option<Vec<JobId>>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
+    // From Server
+    fn handle_deregister_server(
+        &self,
+        server_id: ServerId,
+    ) -> ExtResult<DeregisterServerResult, Error>;
     // From Server
     fn handle_update_job_state(
         &self,
@@ -710,6 +771,10 @@ pub trait ServerIncoming: Send + Sync {
         outputs: Vec<String>,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
+    // Snapshot of the job ids this server is currently running, reported in
+    // every heartbeat so the scheduler can reap only jobs a server no longer
+    // reports (liveness lease), never a genuinely-slow live compile.
+    fn active_jobs(&self) -> Vec<JobId>;
 }
 
 #[cfg(feature = "dist-server")]
@@ -753,5 +818,9 @@ pub trait Client: Send + Sync {
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
     ) -> Result<(Toolchain, Option<(String, PathBuf)>)>;
     fn rewrite_includes_only(&self) -> bool;
+    /// Whether a failed or incomplete remote compile is recompiled locally.
+    fn fallback_enabled(&self) -> bool {
+        true
+    }
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

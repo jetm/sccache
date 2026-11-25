@@ -74,6 +74,20 @@ mod toolchain_imp {
 
     use crate::errors::*;
 
+    /// Whether a directory entry belongs in a best-effort package: a regular
+    /// file, or a symlink that resolves to one. A dangling symlink (e.g. a
+    /// sysroot-relative link that resolves outside the packaged tree, like an OE
+    /// recipe-sysroot-native `usr/bin/sg`) makes metadata fail, so it is skipped
+    /// rather than aborting the whole package. add_file resolves a symlink and
+    /// tarify_path records the link.
+    fn is_packable_file(path: &Path, file_type: std::fs::FileType) -> bool {
+        if file_type.is_symlink() {
+            fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+        } else {
+            file_type.is_file()
+        }
+    }
+
     pub struct ToolchainPackageBuilder {
         // Put dirs and file in a deterministic order (map from tar_path -> real_path)
         dir_set: BTreeMap<PathBuf, PathBuf>,
@@ -98,6 +112,33 @@ mod toolchain_imp {
         }
 
         pub fn add_executable_and_deps(&mut self, executable: PathBuf) -> Result<()> {
+            // A relocated program interpreter (e.g. a Yocto/OE uninative
+            // toolchain) resolves its libc/libm against its own sysroot, not the
+            // host paths ldd reports. Bundle the interpreter's directory so those
+            // libraries exist where the loader looks inside the build sandbox.
+            if let Some(libdir) = read_elf_interpreter(&executable)
+                .and_then(|interp| relocated_interpreter_libdir(&interp))
+            {
+                self.add_dir_contents(&libdir).with_context(|| {
+                    format!(
+                        "Failed to bundle relocated interpreter libdir {}",
+                        libdir.display()
+                    )
+                })?;
+                // Split-sysroot toolchains (e.g. the OE buildtools SDK) keep the
+                // loader plus libc/libm in <sysroot>/lib but the compiler's own
+                // dependency libraries (libmpc, libbfd, libsframe, ...) in
+                // <sysroot>/usr/lib. The relocated loader searches both, but ldd
+                // (run against the host) resolves those deps to host paths or
+                // reports them "not found", so they never land where the sandbox
+                // loader looks. Bundle the sysroot usr/lib shared libraries so
+                // every NEEDED lib resolves inside the build sandbox.
+                if let Some(usr_libdir) = sysroot_usr_libdir(&libdir) {
+                    self.add_shared_libraries(&usr_libdir).with_context(|| {
+                        format!("Failed to bundle sysroot usr/lib {}", usr_libdir.display())
+                    })?;
+                }
+            }
             let mut remaining = vec![executable];
             while let Some(obj_path) = remaining.pop() {
                 assert!(obj_path.is_absolute());
@@ -159,21 +200,39 @@ mod toolchain_imp {
             // best-effort auto packaging
             for entry in WalkDir::new(dir_path).follow_links(false) {
                 let entry = entry?;
-                let file_type = entry.file_type();
-                if file_type.is_dir() {
-                    continue;
-                } else if file_type.is_symlink() {
-                    let metadata = fs::metadata(entry.path())?;
-                    if !metadata.file_type().is_file() {
-                        continue;
-                    }
-                } else if !file_type.is_file() {
-                    // Device or other oddity
+                if !is_packable_file(entry.path(), entry.file_type()) {
                     continue;
                 }
                 trace!("walkdir add_file {}", entry.path().display());
                 // It's either a file, or a symlink pointing to a file
                 self.add_file(entry.path().to_owned())?;
+            }
+            Ok(())
+        }
+
+        /// Add the shared libraries directly in `dir_path` to the package.
+        ///
+        /// Unlike `add_dir_contents` this is shallow and filtered to files
+        /// whose name looks like an ELF shared object (`*.so`, `*.so.N...`), so
+        /// bundling a large sysroot `usr/lib` pulls in only the runtime
+        /// libraries the relocated loader resolves -- not headers, static
+        /// archives, or subdirectories. Missing directories are a no-op.
+        pub fn add_shared_libraries(&mut self, dir_path: &Path) -> Result<()> {
+            if !dir_path.is_dir() {
+                return Ok(());
+            }
+            for entry in fs::read_dir(dir_path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.ends_with(".so") || name.contains(".so.")) {
+                    continue;
+                }
+                if !is_packable_file(&entry.path(), entry.file_type()?) {
+                    continue;
+                }
+                trace!("shared lib add_file {}", entry.path().display());
+                self.add_file(entry.path())?;
             }
             Ok(())
         }
@@ -351,6 +410,106 @@ mod toolchain_imp {
         libs
     }
 
+    /// Read a binary's ELF program interpreter (PT_INTERP), if it has one.
+    ///
+    /// Returns `None` for static binaries, non-ELF or non-64-bit files, and
+    /// anything that fails to parse -- callers treat that as "nothing special
+    /// to bundle", preserving the default ldd-only behaviour.
+    fn read_elf_interpreter(executable: &Path) -> Option<PathBuf> {
+        use object::Endianness;
+        use object::read::elf::{ElfFile64, ProgramHeader};
+
+        let data = fs::read(executable).ok()?;
+        let elf = ElfFile64::<Endianness>::parse(data.as_slice()).ok()?;
+        let endian = elf.endian();
+        for header in elf.elf_program_headers() {
+            if let Ok(Some(interp)) = header.interpreter(endian, elf.data()) {
+                return str::from_utf8(interp).ok().map(PathBuf::from);
+            }
+        }
+        None
+    }
+
+    /// If `interp` is a relocated program interpreter -- one living outside the
+    /// standard host loader directories -- return the directory that should be
+    /// bundled alongside the toolchain.
+    ///
+    /// Yocto/OpenEmbedded "uninative" cross toolchains ship their own glibc and
+    /// loader, and the loader's built-in search path points at its own sysroot
+    /// lib dir rather than the host's. `ldd` resolves a binary's NEEDED
+    /// libraries against the *host* loader, so for these binaries it reports
+    /// host paths (e.g. /usr/lib/libm.so.6) that do not exist where the
+    /// relocated loader actually searches at runtime. Bundling the
+    /// interpreter's own directory -- which holds the matching libc/libm and
+    /// the loader itself -- makes the toolchain resolvable inside the sandbox.
+    fn relocated_interpreter_libdir(interp: &Path) -> Option<PathBuf> {
+        const STANDARD_LOADER_PREFIXES: &[&str] = &["/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/"];
+        let interp_str = interp.to_str()?;
+        if STANDARD_LOADER_PREFIXES
+            .iter()
+            .any(|prefix| interp_str.starts_with(prefix))
+        {
+            return None;
+        }
+        interp.parent().map(Path::to_path_buf)
+    }
+
+    /// Given a relocated interpreter's lib dir (`<sysroot>/lib`), return the
+    /// sibling `<sysroot>/usr/lib` when it exists.
+    ///
+    /// Split-sysroot toolchains (the OE buildtools SDK) keep the compiler's
+    /// dependency libraries there rather than beside the loader; uninative
+    /// sysroots have no `usr/lib`, so this returns `None` and leaves that path
+    /// untouched.
+    fn sysroot_usr_libdir(libdir: &Path) -> Option<PathBuf> {
+        let usr_lib = libdir.parent()?.join("usr").join("lib");
+        usr_lib.is_dir().then_some(usr_lib)
+    }
+
+    #[test]
+    fn test_sysroot_usr_libdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let libdir = tmp.path().join("sysroot").join("lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+
+        // A uninative sysroot has no usr/lib sibling: leave that path untouched.
+        assert_eq!(sysroot_usr_libdir(&libdir), None);
+
+        // A split sysroot (OE buildtools SDK) has usr/lib: bundle it.
+        let usr_lib = tmp.path().join("sysroot").join("usr").join("lib");
+        std::fs::create_dir_all(&usr_lib).unwrap();
+        assert_eq!(sysroot_usr_libdir(&libdir), Some(usr_lib));
+    }
+
+    #[test]
+    fn test_add_dir_contents_skips_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A real file that must be packaged.
+        let real = root.join("real_file");
+        std::fs::write(&real, b"contents").unwrap();
+
+        // A dangling symlink whose target does not exist -- the shape of an
+        // OE recipe-sysroot-native `usr/bin/sg` that points outside the
+        // packaged tree. Before the fix, fs::metadata on this aborted the
+        // whole toolchain package.
+        let dangling = root.join("dangling_link");
+        symlink("does/not/exist", &dangling).unwrap();
+
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_dir_contents(root).unwrap();
+
+        let packaged: Vec<PathBuf> = builder.file_set.values().cloned().collect();
+        assert!(packaged.contains(&real), "real file must still be packaged");
+        assert!(
+            !packaged.contains(&dangling),
+            "dangling symlink must be skipped, not packaged"
+        );
+    }
+
     #[test]
     fn test_ldd_parse() {
         let ubuntu_ls_output = "\tlinux-vdso.so.1 =>  (0x00007fffcfffe000)
@@ -410,14 +569,38 @@ mod toolchain_imp {
             ]
         );
     }
+
+    #[test]
+    fn test_relocated_interpreter_libdir() {
+        // Standard host loaders are left to ldd's host resolution.
+        for standard in [
+            "/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib/ld-linux-aarch64.so.1",
+            "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        ] {
+            assert_eq!(
+                relocated_interpreter_libdir(Path::new(standard)),
+                None,
+                "{standard} is a standard host loader and must not trigger bundling"
+            );
+        }
+
+        // A relocated loader (e.g. a Yocto/OE uninative toolchain) resolves its
+        // libc/libm against its own sysroot lib dir, which ldd does not report.
+        // Return that directory so it gets bundled into the toolchain package.
+        assert_eq!(
+            relocated_interpreter_libdir(Path::new(
+                "/home/u/build/tmp/sysroots-uninative/x86_64-linux/lib/ld-linux-x86-64.so.2"
+            )),
+            Some(PathBuf::from(
+                "/home/u/build/tmp/sysroots-uninative/x86_64-linux/lib"
+            ))
+        );
+    }
 }
 
-fn populate_tar_header<'a>(
-    header: &mut tar::Header,
-    src: &Path,
-    dest: &'a str,
-    is_dir: bool,
-) -> &'a str {
+fn populate_tar_header(header: &mut tar::Header, src: &Path, is_dir: bool) {
     match fs::metadata(src) {
         Ok(metadata) if !is_dir || metadata.is_dir() => {
             // TODO: if the source file is a symlink, I think this does bad things
@@ -453,24 +636,22 @@ fn populate_tar_header<'a>(
             header.set_entry_type(entry_type);
         }
     }
+}
 
-    // tar-rs imposes that archive paths are relative
+/// Builds a GNU header describing `src`. The path is set later by
+/// `append_tar_entry`, which lets tar-rs emit a long-name entry when needed.
+pub fn make_tar_header(src: &Path) -> io::Result<tar::Header> {
+    let mut file_header = tar::Header::new_gnu();
+    populate_tar_header(&mut file_header, src, false);
+    Ok(file_header)
+}
+
+/// Turns an absolute dist path into the relative one tar-rs requires.
+fn relative_dist_path(dest: &str) -> &str {
     assert!(dest.starts_with('/'));
     let dest = dest.trim_start_matches('/');
     assert!(!dest.starts_with('/'));
     dest
-}
-
-pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
-    let mut file_header = tar::Header::new_ustar();
-    let dest = populate_tar_header(&mut file_header, src, dest, false);
-    // `set_path` converts its argument to a Path and back to bytes on Windows, so this is
-    // a bit of an inefficient round-trip. Windows path separators will also be normalised
-    // to be like Unix, and the path is (now) relative so there should be no funny results
-    // due to Windows
-    // TODO: should really use a `set_path_str` or similar
-    file_header.set_path(dest)?;
-    Ok(file_header)
 }
 
 pub fn append_tar_dir<W: io::Write>(
@@ -479,8 +660,28 @@ pub fn append_tar_dir<W: io::Write>(
     dest: &str,
 ) -> io::Result<()> {
     let mut dir_header = tar::Header::new_gnu();
-    let dest = populate_tar_header(&mut dir_header, src, dest, true);
-    builder.append_data(&mut dir_header, dest, io::empty())
+    populate_tar_header(&mut dir_header, src, true);
+    builder.append_data(&mut dir_header, relative_dist_path(dest), io::empty())
+}
+
+/// Append a file entry to `builder` under the dist path `dest`.
+///
+/// `dest` is an absolute dist path; tar-rs requires a relative path, so the
+/// leading `/` is stripped. Routing through `Builder::append_data` (rather than
+/// `Builder::append` with a pre-set path) makes tar-rs emit a GNU `@LongLink`
+/// long-name entry when `dest` exceeds the ustar `name`/`prefix` limits. Deep
+/// OE build paths (e.g. gcc-runtime's libstdc++-v3 tree) overrun those limits,
+/// and a plain ustar header fails with "provided value is too long when setting
+/// path". `Header::set_size` must already be correct on `header`.
+pub fn append_tar_entry<W: io::Write, R: io::Read>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    dest: &str,
+    data: R,
+) -> io::Result<()> {
+    // `append_data` sets the path (emitting a GNU long-name entry if needed) and
+    // recomputes the checksum before writing the header and `data`.
+    builder.append_data(header, relative_dist_path(dest), data)
 }
 
 /// Simplify a path to one without any relative components, erroring if it looks
@@ -559,6 +760,7 @@ impl SimplifyPath<'_> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn test_simplify_path_and_dirs() {
@@ -609,7 +811,7 @@ mod test {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             append_tar_dir(&mut builder, &existing_dir, "/dist/existing").unwrap();
             append_tar_dir(&mut builder, &missing, "/dist/missing").unwrap();
-            let file_hdr = make_tar_header(&missing, "/dist/missing.rs").unwrap();
+            let file_hdr = make_tar_header(&missing).unwrap();
             assert_eq!(file_hdr.entry_type(), tar::EntryType::Regular);
             assert_eq!(file_hdr.mode().unwrap(), 0o644);
             builder.finish().unwrap();
@@ -639,5 +841,45 @@ mod test {
                 0o755
             )
         );
+    }
+
+    #[test]
+    fn test_append_tar_entry_roundtrips_long_path() {
+        // A final path component longer than the ustar name field (100 bytes),
+        // which ustar cannot split across name/prefix, mirroring the deep
+        // gcc-runtime libstdc++-v3 build tree that triggers the failure.
+        let dest = format!(
+            "/build/gcc-runtime/13.4.0/libstdc++-v3/src/c++98/{}.o",
+            "b".repeat(120)
+        );
+        let relative = dest.trim_start_matches('/');
+        assert!(relative.len() > 100);
+
+        // The old ustar-header path could not encode this: set_path errors with
+        // "provided value is too long", which is the bug this change fixes.
+        let mut ustar = tar::Header::new_ustar();
+        assert!(ustar.set_path(relative).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("input.o");
+        let contents = b"long-path-payload";
+        fs::write(&src, &contents[..]).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = make_tar_header(&src).unwrap();
+            header.set_size(contents.len() as u64);
+            append_tar_entry(&mut builder, &mut header, &dest, &contents[..]).unwrap();
+            builder.into_inner().unwrap();
+        }
+
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        let entry_path = entry.path().unwrap().to_string_lossy().into_owned();
+        assert_eq!(entry_path, relative);
+        let mut read_back = Vec::new();
+        entry.read_to_end(&mut read_back).unwrap();
+        assert_eq!(read_back, contents);
     }
 }

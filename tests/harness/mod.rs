@@ -190,6 +190,9 @@ pub fn sccache_client_cfg(
             toolchains: vec![],
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
+            fallback: true,
+            client_deserialize_offload_threshold: 1024 * 1024,
+            run_job_compression_level: 1,
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -230,6 +233,8 @@ fn sccache_server_cfg(
             token: DIST_SERVER_TOKEN.to_owned(),
         },
         toolchain_cache_size: TC_CACHE_SIZE,
+        num_cpus: None,
+        colocated_reserve_fraction: None,
     }
 }
 
@@ -366,7 +371,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 0,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _
                     }
                 ) {
                     Ok(())
@@ -459,6 +465,7 @@ impl DistSystem {
             Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
             self.scheduler_url().to_url(),
             token,
+            sccache::util::num_cpus(),
             handler,
         )
         .unwrap();
@@ -537,7 +544,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 1,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        servers: _
                     }
                 ) {
                     Ok(())
@@ -632,29 +640,34 @@ impl Drop for DistSystem {
         }
         for &pid in self.server_pids.iter() {
             droperr!(nix::sys::signal::kill(pid, Signal::SIGINT));
-            thread::sleep(Duration::from_millis(100));
+            // On SIGINT the server deregisters from the scheduler before it
+            // exits, so poll for the exit instead of sleeping a fixed time.
             let mut killagain = true; // Default to trying to kill again, e.g. if there was an error waiting on the pid
-            droperr!(
-                nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)).map(|ws| {
-                    if ws != WaitStatus::StillAlive {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(WaitStatus::StillAlive) => break,
+                    Ok(ws) => {
                         killagain = false;
                         exits.push(ws);
+                        break;
                     }
-                })
-            );
+                    Err(e) => {
+                        did_err = true;
+                        eprintln!("Error waiting on server pid after SIGINT: {}", e);
+                        break;
+                    }
+                }
+            }
             if killagain {
                 eprintln!("SIGINT didn't kill process, trying SIGKILL");
                 droperr!(nix::sys::signal::kill(pid, Signal::SIGKILL));
-                droperr!(
-                    nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG))
-                        .map_err(|e| e.to_string())
-                        .and_then(|ws| if ws == WaitStatus::StillAlive {
-                            Err("process alive after sigkill".to_owned())
-                        } else {
-                            exits.push(ws);
-                            Ok(())
-                        })
-                );
+                // Blocking: SIGKILL cannot be ignored, and a non-blocking wait
+                // right after the signal races the kernel tearing the process down.
+                droperr!(nix::sys::wait::waitpid(pid, None).map(|ws| exits.push(ws)));
             }
         }
 

@@ -199,13 +199,20 @@ fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Resu
 }
 
 #[cfg(unix)]
-fn get_signal(status: ExitStatus) -> i32 {
+fn get_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::prelude::*;
-    status.signal().expect("must have signal")
+    // None when the process produced neither an exit code nor a terminating
+    // signal - e.g. an ExitStatus synthesized from a distributed-compile result,
+    // or an abnormal wait status. Previously this was `.expect("must have
+    // signal")`, which panicked the compile task (surfacing as a misleading
+    // "Failed to bind socket") and could be tripped repeatedly under load.
+    status.signal()
 }
 #[cfg(windows)]
-fn get_signal(_status: ExitStatus) -> i32 {
-    panic!("no signals on windows")
+fn get_signal(_status: ExitStatus) -> Option<i32> {
+    // On Windows ExitStatus::code() is always Some, so the signal branch is
+    // never reached; return None rather than panicking.
+    None
 }
 
 pub struct DistClientContainer {
@@ -226,6 +233,9 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
+    fallback: bool,
+    deserialize_offload_threshold: u64,
+    run_job_compression_level: u32,
 }
 
 #[cfg(feature = "dist-client")]
@@ -282,6 +292,9 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
+            fallback: config.dist.fallback,
+            deserialize_offload_threshold: config.dist.client_deserialize_offload_threshold,
+            run_job_compression_level: config.dist.run_job_compression_level,
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -448,7 +461,10 @@ impl DistClientContainer {
                     &config.toolchains,
                     auth_token,
                     config.rewrite_includes_only,
-                );
+                    config.deserialize_offload_threshold,
+                    config.run_job_compression_level,
+                )
+                .map(|client| client.with_fallback(config.fallback));
                 let dist_client =
                     try_or_retry_later!(dist_client.context("failure during dist client creation"));
                 use crate::dist::Client;
@@ -1165,6 +1181,9 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
+                    fallback: true,
+                    deserialize_offload_threshold: 1024 * 1024,
+                    run_job_compression_level: 1,
                 }),
                 dist_client,
             ))),
@@ -1741,7 +1760,7 @@ where
 
                     match status.code() {
                         Some(code) => res.retcode = Some(code),
-                        None => res.signal = Some(get_signal(status)),
+                        None => res.signal = get_signal(status),
                     }
 
                     res.stdout = stdout;
@@ -1757,7 +1776,7 @@ where
 
                             match output.status.code() {
                                 Some(code) => res.retcode = Some(code),
-                                None => res.signal = Some(get_signal(output.status)),
+                                None => res.signal = get_signal(output.status),
                             }
                             res.stdout = output.stdout;
                             res.stderr = output.stderr;
@@ -1769,6 +1788,18 @@ where
                                 me.dist_client.reset_state().await;
                                 let errmsg =
                                     format!("[{:?}] http error status: {}", out_pretty, msg);
+                                error!("{}", errmsg);
+                                res.retcode = Some(1);
+                                res.stderr = errmsg.as_bytes().to_vec();
+                            }
+                            // Reported to the build as a plain failure: the cache is
+                            // healthy and the dist client needs no reset.
+                            Err(err) if err.downcast_ref::<DistOutputMissing>().is_some() => {
+                                // Make sure the write guard has been dropped ASAP.
+                                drop(stats);
+                                // `{:#}`: the outer context names only the object being
+                                // stored; the missing output is the root message.
+                                let errmsg = format!("[{:?}] {:#}", out_pretty, err);
                                 error!("{}", errmsg);
                                 res.retcode = Some(1);
                                 res.stderr = errmsg.as_bytes().to_vec();
@@ -2638,6 +2669,26 @@ mod tests {
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::test::utils::{TestFixture, next_command, next_command_calls};
 
+    #[cfg(unix)]
+    #[test]
+    fn test_get_signal_handles_signal_and_abnormal_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Terminated by SIGKILL: a real terminating signal is reported.
+        let killed = ExitStatus::from_raw(9);
+        assert_eq!(killed.code(), None);
+        assert_eq!(get_signal(killed), Some(9));
+
+        // A wait status that is neither a normal exit (code) nor a terminating
+        // signal - here WIFSTOPPED (low byte 0x7f). The same neither-code-nor-
+        // signal shape can arise from an ExitStatus synthesized for a
+        // distributed compile. get_signal must return None, not panic
+        // "must have signal" (which used to crash the in-flight compile task).
+        let abnormal = ExitStatus::from_raw(0x7f);
+        assert_eq!(abnormal.code(), None);
+        assert_eq!(get_signal(abnormal), None);
+    }
+
     struct StringWriter {
         buffer: String,
     }
@@ -2774,6 +2825,9 @@ mod tests {
             toolchain_cache_size: 0,
             toolchains: vec![],
             rewrite_includes_only: false,
+            fallback: true,
+            deserialize_offload_threshold: 1024 * 1024,
+            run_job_compression_level: 1,
         };
         let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
             Box::new(config),

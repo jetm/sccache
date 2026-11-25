@@ -46,6 +46,18 @@ scheduler_url = "http://1.2.3.4:10600"
 toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
+# whether a distributed compile that fails on the build server (non-zero exit)
+# or leaves out a declared output is recompiled locally. Default: true.
+# With false the remote result is reported to the client as is. An sccache
+# binary that predates this key rejects a configuration containing it,
+# because unknown keys are denied.
+fallback = true
+# responses larger than this many bytes are deserialized on a blocking thread
+# so they do not stall the async client. Default: 1048576 (1 MiB).
+client_deserialize_offload_threshold = 1048576
+# zlib level used to compress the inputs sent for a distributed compile:
+# 0 disables compression, 1 to 9 select the zlib level. Default: 1.
+run_job_compression_level = 1
 cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]

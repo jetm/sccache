@@ -65,13 +65,15 @@ mod common {
         }
     }
 
+    // Send the request and return the body of a successful response, mapping an
+    // error status to the same errors bincode_req_fut reports.
     #[cfg(feature = "dist-client")]
-    pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + 'static>(
-        req: reqwest::RequestBuilder,
-    ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let res = req.header(header::CONNECTION, "close").send().await?;
+    async fn success_body_fut(req: reqwest::RequestBuilder) -> Result<bytes::Bytes> {
+        // A5: keep-alive is left enabled (no `Connection: close`), so a reused
+        // connection reaches tiny_http, which risks issue #151 (pipeline/body
+        // desync) surfacing as bincode decode errors under soak. Revert point:
+        // re-add `.header(header::CONNECTION, "close")` on the request below.
+        let res = req.send().await?;
 
         let status = res.status();
         let bytes = res.bytes().await?;
@@ -86,6 +88,28 @@ mod common {
             } else {
                 anyhow::bail!(errmsg);
             }
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "dist-client")]
+    pub async fn scheduler_status_req_fut(
+        req: reqwest::RequestBuilder,
+    ) -> Result<dist::SchedulerStatusResult> {
+        dist::SchedulerStatusResult::from_bincode(&success_body_fut(req).await?)
+    }
+
+    #[cfg(feature = "dist-client")]
+    pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + Send + 'static>(
+        req: reqwest::RequestBuilder,
+        deserialize_offload_threshold: u64,
+    ) -> Result<T> {
+        let bytes = success_body_fut(req).await?;
+        if bytes.len() as u64 > deserialize_offload_threshold {
+            // Deserializing a multi-MB blob inline stalls this async worker from
+            // polling other in-flight requests; offload large payloads to a
+            // blocking thread so the reactor keeps making progress.
+            Ok(tokio::task::spawn_blocking(move || bincode::deserialize(&bytes)).await??)
         } else {
             Ok(bincode::deserialize(&bytes)?)
         }
@@ -150,6 +174,7 @@ mod common {
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
+        pub active_jobs: Vec<dist::JobId>,
     }
 
     #[cfg(feature = "dist-server")]
@@ -163,6 +188,7 @@ mod common {
                     "cert_digest",
                     &BASE64_URL_SAFE_ENGINE.encode(&self.cert_digest),
                 )
+                .field("active_jobs", &self.active_jobs)
                 .finish()
         }
     }
@@ -208,6 +234,11 @@ pub mod urls {
             .join("/api/v1/scheduler/status")
             .expect("failed to create alloc job url")
     }
+    pub fn scheduler_deregister_server(scheduler_url: &reqwest::Url) -> reqwest::Url {
+        scheduler_url
+            .join("/api/v1/scheduler/deregister_server")
+            .expect("failed to create deregister url")
+    }
 
     pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
         let url = format!(
@@ -249,7 +280,7 @@ mod server {
     use std::net::SocketAddr;
     use std::result::Result as StdResult;
     use std::sync::atomic;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -259,9 +290,10 @@ mod server {
     };
     use super::urls;
     use crate::dist::{
-        self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
-        JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
-        SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
+        self, AllocJobResult, AssignJobResult, DeregisterServerResult, HeartbeatServerResult,
+        InputsReader, JobAuthorizer, JobId, JobState, RunJobResult, SchedulerStatusResult,
+        ServerId, ServerNonce, SubmitToolchainResult, Toolchain, ToolchainReader,
+        UpdateJobStateResult,
     };
     use crate::errors::*;
 
@@ -272,9 +304,12 @@ mod server {
     pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
         req: reqwest::blocking::RequestBuilder,
     ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let mut res = req.header(reqwest::header::CONNECTION, "close").send()?;
+        // A5: keep-alive is left enabled (no `Connection: close`), so a reused
+        // connection reaches tiny_http, which risks issue #151 (pipeline/body
+        // desync) surfacing as bincode decode errors under soak. Revert point:
+        // re-add `.header(reqwest::header::CONNECTION, "close")` on the request
+        // below.
+        let mut res = req.send()?;
         let status = res.status();
         let mut body = vec![];
         res.copy_to(&mut body)
@@ -401,6 +436,7 @@ mod server {
     pub enum RouilleBincodeError {
         BodyAlreadyExtracted,
         WrongContentType,
+        TooLarge,
         ParseError(bincode::Error),
     }
     impl From<bincode::Error> for RouilleBincodeError {
@@ -431,27 +467,108 @@ mod server {
                     RouilleBincodeError::WrongContentType => {
                         "the request didn't have a binary content type"
                     }
+                    RouilleBincodeError::TooLarge => "the request body is too large",
                     RouilleBincodeError::ParseError(_) => "error while parsing the bincode body",
                 }
             )
+        }
+    }
+    fn check_octet_stream(
+        request: &rouille::Request,
+    ) -> std::result::Result<(), RouilleBincodeError> {
+        match request.header("Content-Type") {
+            Some(header) if header.starts_with("application/octet-stream") => Ok(()),
+            _ => Err(RouilleBincodeError::WrongContentType),
         }
     }
     fn bincode_input<O>(request: &rouille::Request) -> std::result::Result<O, RouilleBincodeError>
     where
         O: serde::de::DeserializeOwned,
     {
-        if let Some(header) = request.header("Content-Type") {
-            if !header.starts_with("application/octet-stream") {
-                return Err(RouilleBincodeError::WrongContentType);
-            }
-        } else {
-            return Err(RouilleBincodeError::WrongContentType);
-        }
+        check_octet_stream(request)?;
 
         if let Some(mut b) = request.data() {
             bincode::deserialize_from::<_, O>(&mut b).map_err(From::from)
         } else {
             Err(RouilleBincodeError::BodyAlreadyExtracted)
+        }
+    }
+
+    // A heartbeat carries a cert and the active job list; 1 MiB is far above
+    // any real one and bounds what a hostile sender can make us buffer.
+    const MAX_HEARTBEAT_BODY: usize = 1024 * 1024;
+
+    // The heartbeat as servers sent it before the active-jobs report.
+    #[derive(Deserialize)]
+    struct HeartbeatBeforeActiveJobs {
+        jwt_key: Vec<u8>,
+        num_cpus: usize,
+        server_nonce: dist::ServerNonce,
+        cert_digest: Vec<u8>,
+        cert_pem: Vec<u8>,
+    }
+
+    // `active_jobs` is None when the server predates the report.
+    struct HeartbeatBody {
+        jwt_key: Vec<u8>,
+        num_cpus: usize,
+        server_nonce: dist::ServerNonce,
+        cert_digest: Vec<u8>,
+        cert_pem: Vec<u8>,
+        active_jobs: Option<Vec<JobId>>,
+    }
+
+    // Both layouts are decoded from the same buffered bytes, so a body is
+    // accepted only if exactly one layout consumes all of it. The free
+    // bincode functions ignore leftover bytes, which would let a current body
+    // pass as the older layout and drop its job list.
+    fn decode_heartbeat_body<R: Read>(
+        body: R,
+    ) -> std::result::Result<HeartbeatBody, RouilleBincodeError> {
+        use bincode::Options;
+
+        let mut bytes = Vec::new();
+        body.take(MAX_HEARTBEAT_BODY as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| RouilleBincodeError::ParseError(Box::new(bincode::ErrorKind::Io(e))))?;
+        if bytes.len() > MAX_HEARTBEAT_BODY {
+            return Err(RouilleBincodeError::TooLarge);
+        }
+        let opts = || {
+            bincode::options()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+        };
+        match opts().deserialize::<HeartbeatServerHttpRequest>(&bytes) {
+            Ok(h) => Ok(HeartbeatBody {
+                jwt_key: h.jwt_key,
+                num_cpus: h.num_cpus,
+                server_nonce: h.server_nonce,
+                cert_digest: h.cert_digest,
+                cert_pem: h.cert_pem,
+                active_jobs: Some(h.active_jobs),
+            }),
+            Err(_) => {
+                let h = opts().deserialize::<HeartbeatBeforeActiveJobs>(&bytes)?;
+                Ok(HeartbeatBody {
+                    jwt_key: h.jwt_key,
+                    num_cpus: h.num_cpus,
+                    server_nonce: h.server_nonce,
+                    cert_digest: h.cert_digest,
+                    cert_pem: h.cert_pem,
+                    active_jobs: None,
+                })
+            }
+        }
+    }
+
+    fn heartbeat_input(
+        request: &rouille::Request,
+    ) -> std::result::Result<HeartbeatBody, RouilleBincodeError> {
+        check_octet_stream(request)?;
+        match request.data() {
+            Some(b) => decode_heartbeat_body(b),
+            None => Err(RouilleBincodeError::BodyAlreadyExtracted),
         }
     }
 
@@ -748,9 +865,11 @@ mod server {
                 }
                 // Finish the client
                 let new_client = client_builder
-                    // Disable connection pool to avoid broken connection
-                    // between runtime
-                    .pool_max_idle_per_host(0)
+                    // Keep a small idle pool so keep-alive connections are
+                    // reused across coordination calls; expire them under the
+                    // LAN idle limit to avoid reusing a half-closed socket.
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(90))
                     .build()
                     .context("failed to create a HTTP client")?;
                 // Use the updated certificates
@@ -805,10 +924,10 @@ mod server {
                     },
                     (POST) (/api/v1/scheduler/heartbeat_server) => {
                         let server_id = check_server_auth_or_err!(request);
-                        let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
-                        trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
+                        let heartbeat_server = try_or_400_log!(req_id, heartbeat_input(request));
+                        trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: active_jobs={:?}", req_id, heartbeat_server.active_jobs);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatBody { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem, active_jobs } = heartbeat_server;
                         try_or_500_log!(req_id, maybe_update_certs(
                             &mut requester.client.lock().unwrap(),
                             &mut server_certificates.lock().unwrap(),
@@ -818,7 +937,8 @@ mod server {
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             num_cpus,
-                            job_authorizer
+                            job_authorizer,
+                            active_jobs
                         ));
                         prepare_response(request, &res)
                     },
@@ -834,6 +954,19 @@ mod server {
                     },
                     (GET) (/api/v1/scheduler/status) => {
                         let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
+                        // The route stays open for the aggregate counts a stock
+                        // client reads, but the per-server list names every build
+                        // server's address, so it needs a valid client token.
+                        let authenticated = bearer_http_auth(request)
+                            .is_some_and(|token| check_client_auth.check(token).is_ok());
+                        let res = if authenticated { res } else { res.without_server_list() };
+                        prepare_response(request, &res)
+                    },
+                    (POST) (/api/v1/scheduler/deregister_server) => {
+                        let server_id = check_server_auth_or_err!(request);
+                        trace!("Req {}: deregister_server: {:?}", req_id, server_id);
+
+                        let res: DeregisterServerResult = try_or_500_log!(req_id, handler.handle_deregister_server(server_id));
                         prepare_response(request, &res)
                     },
                     _ => {
@@ -874,6 +1007,24 @@ mod server {
         }
     }
 
+    static SHUTDOWN_REQUESTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+    extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+        // Async-signal-safe: only an atomic store. The deregister + exit run
+        // on a normal worker thread that polls this flag.
+        SHUTDOWN_REQUESTED.store(true, atomic::Ordering::SeqCst);
+    }
+
+    fn install_shutdown_handler() {
+        // SAFETY: the handler performs only an async-signal-safe atomic store,
+        // which is sound to run from a signal handler.
+        let handler = handle_shutdown_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGINT, handler);
+        }
+    }
+
     pub struct Server<S> {
         bind_address: SocketAddr,
         scheduler_url: reqwest::Url,
@@ -886,6 +1037,11 @@ mod server {
         jwt_key: Vec<u8>,
         // Randomly generated nonce to allow the scheduler to detect server restarts
         server_nonce: ServerNonce,
+        // Core count advertised to the scheduler's load model. Defaults to the
+        // detected hardware count; a config override lets the colocated node
+        // advertise fewer so load_weight reserves cores for its preprocessing
+        // and toolchain-packaging tax.
+        advertised_num_cpus: usize,
         handler: S,
     }
 
@@ -895,6 +1051,7 @@ mod server {
             bind_address: Option<SocketAddr>,
             scheduler_url: reqwest::Url,
             scheduler_auth: String,
+            advertised_num_cpus: usize,
             handler: S,
         ) -> Result<Self> {
             let (cert_digest, cert_pem, privkey_pem) =
@@ -913,6 +1070,7 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                advertised_num_cpus,
                 handler,
             })
         }
@@ -927,15 +1085,52 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                advertised_num_cpus,
                 handler,
             } = self;
-            let heartbeat_req = HeartbeatServerHttpRequest {
-                num_cpus: num_cpus(),
-                jwt_key: jwt_key.clone(),
-                server_nonce,
-                cert_digest,
-                cert_pem: cert_pem.clone(),
-            };
+            // Shared so the heartbeat thread can snapshot the handler's
+            // running-jobs set each beat while the request router still owns it.
+            let handler = Arc::new(handler);
+            // Graceful shutdown: on SIGTERM/SIGINT, deregister from the
+            // scheduler before exiting so it drops us at once instead of
+            // waiting out the 90s heartbeat timeout. The timeout stays as the
+            // backstop for an ungraceful death (crash / power loss).
+            let deregister_url = urls::scheduler_deregister_server(&scheduler_url);
+            let deregister_auth = scheduler_auth.clone();
+            install_shutdown_handler();
+            thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    // Bounds connect + request: a stop must not hang on a
+                    // scheduler that is down, systemd's stop timeout is longer.
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .expect("deregister http client must build");
+                loop {
+                    if SHUTDOWN_REQUESTED.load(atomic::Ordering::SeqCst) {
+                        info!("Shutdown signal received; deregistering from scheduler");
+                        let res: Result<DeregisterServerResult> = bincode_req(
+                            client
+                                .post(deregister_url.clone())
+                                .bearer_auth(deregister_auth.clone())
+                                .bincode(&())
+                                .expect("failed to serialize deregister"),
+                        );
+                        match res {
+                            Ok(_) => info!("Deregistered from scheduler"),
+                            Err(e) => error!("Failed to deregister from scheduler: {}", e),
+                        }
+                        std::process::exit(0);
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            });
+
+            // Values the heartbeat thread rebuilds its request from each beat.
+            // cert_digest and server_nonce are used only here, so move them in;
+            // jwt_key and cert_pem are still needed below, so clone for the thread.
+            let heartbeat_jwt_key = jwt_key.clone();
+            let heartbeat_cert_pem = cert_pem.clone();
+            let heartbeat_handler = Arc::clone(&handler);
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
@@ -951,6 +1146,19 @@ mod server {
             thread::spawn(move || {
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
+                    // Rebuild the request each beat so active_jobs is a fresh
+                    // snapshot of what this server is running. The scheduler
+                    // reaps a Started job only after two consecutive heartbeats
+                    // omit it, so a stale snapshot could either strand a done
+                    // job or reap a live one.
+                    let heartbeat_req = HeartbeatServerHttpRequest {
+                        num_cpus: advertised_num_cpus,
+                        jwt_key: heartbeat_jwt_key.clone(),
+                        server_nonce: server_nonce.clone(),
+                        cert_digest: cert_digest.clone(),
+                        cert_pem: heartbeat_cert_pem.clone(),
+                        active_jobs: heartbeat_handler.active_jobs(),
+                    };
                     match bincode_req(
                         heartbeat_client
                             .post(heartbeat_url.clone())
@@ -1058,6 +1266,254 @@ mod server {
             .context("POST to scheduler job_state failed")
         }
     }
+
+    #[cfg(test)]
+    mod heartbeat_tests {
+        use super::*;
+        use crate::dist::{
+            AllocJobResult, DeregisterServerResult, JobAuthorizer, SchedulerIncoming,
+            SchedulerOutgoing, SchedulerStatusResult, UpdateJobStateResult,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The request as servers sent it before the active-jobs report.
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct OldHeartbeat {
+            jwt_key: Vec<u8>,
+            num_cpus: usize,
+            server_nonce: dist::ServerNonce,
+            cert_digest: Vec<u8>,
+            cert_pem: Vec<u8>,
+        }
+
+        fn old_heartbeat() -> OldHeartbeat {
+            OldHeartbeat {
+                jwt_key: vec![1, 2, 3],
+                num_cpus: 8,
+                server_nonce: dist::ServerNonce::new(),
+                cert_digest: vec![4, 5],
+                cert_pem: vec![6, 7, 8, 9],
+            }
+        }
+
+        fn current_heartbeat(jobs: Vec<JobId>) -> HeartbeatServerHttpRequest {
+            let old = old_heartbeat();
+            HeartbeatServerHttpRequest {
+                jwt_key: old.jwt_key,
+                num_cpus: old.num_cpus,
+                server_nonce: old.server_nonce,
+                cert_digest: old.cert_digest,
+                cert_pem: old.cert_pem,
+                active_jobs: jobs,
+            }
+        }
+
+        #[test]
+        fn heartbeat_five_field_body_has_no_active_jobs() {
+            let old = old_heartbeat();
+            let body = bincode::serialize(&old).unwrap();
+            let got = decode_heartbeat_body(&body[..]).unwrap();
+            assert_eq!(got.active_jobs, None);
+            assert_eq!(got.num_cpus, old.num_cpus);
+            assert_eq!(got.jwt_key, old.jwt_key);
+            assert_eq!(got.server_nonce, old.server_nonce);
+            assert_eq!(got.cert_digest, old.cert_digest);
+            assert_eq!(got.cert_pem, old.cert_pem);
+        }
+
+        #[test]
+        fn heartbeat_current_body_keeps_its_active_jobs() {
+            let jobs = vec![JobId(3), JobId(9)];
+            let body = bincode::serialize(&current_heartbeat(jobs.clone())).unwrap();
+            let got = decode_heartbeat_body(&body[..]).unwrap();
+            assert_eq!(got.active_jobs, Some(jobs));
+        }
+
+        #[test]
+        fn heartbeat_current_body_decodes_in_older_layout() {
+            let body = bincode::serialize(&current_heartbeat(vec![JobId(3)])).unwrap();
+            let got: OldHeartbeat = bincode::deserialize_from(&body[..]).unwrap();
+            assert_eq!(got, old_heartbeat_with(&got));
+        }
+
+        // Only the nonce is random, so compare everything else through it.
+        fn old_heartbeat_with(got: &OldHeartbeat) -> OldHeartbeat {
+            OldHeartbeat {
+                server_nonce: got.server_nonce.clone(),
+                ..old_heartbeat()
+            }
+        }
+
+        #[test]
+        fn heartbeat_truncated_current_body_is_rejected() {
+            let body = bincode::serialize(&current_heartbeat(vec![JobId(3), JobId(4)])).unwrap();
+            let cut = &body[..body.len() - 3];
+            assert!(matches!(
+                decode_heartbeat_body(cut),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        #[test]
+        fn heartbeat_five_field_body_with_trailing_byte_is_rejected() {
+            let mut body = bincode::serialize(&old_heartbeat()).unwrap();
+            body.push(0);
+            assert!(matches!(
+                decode_heartbeat_body(&body[..]),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        #[test]
+        fn heartbeat_current_body_with_trailing_byte_is_rejected() {
+            let mut body = bincode::serialize(&current_heartbeat(vec![JobId(3)])).unwrap();
+            body.push(0);
+            assert!(matches!(
+                decode_heartbeat_body(&body[..]),
+                Err(RouilleBincodeError::ParseError(_))
+            ));
+        }
+
+        struct CountingRead(Arc<AtomicUsize>);
+        impl Read for CountingRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(buf.len(), Ordering::SeqCst);
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+
+        #[test]
+        fn heartbeat_oversized_body_is_rejected_without_reading_past_the_cap() {
+            let handed_out = Arc::new(AtomicUsize::new(0));
+            let res = decode_heartbeat_body(CountingRead(Arc::clone(&handed_out)));
+            assert!(matches!(res, Err(RouilleBincodeError::TooLarge)));
+            // `Read::take` caps what is requested from the source, not just
+            // what the decoder keeps.
+            assert!(handed_out.load(Ordering::SeqCst) <= MAX_HEARTBEAT_BODY + 1);
+        }
+
+        type Registered = Arc<Mutex<HashMap<ServerId, (usize, Option<Vec<JobId>>)>>>;
+
+        struct RecordingScheduler(Registered);
+        impl SchedulerIncoming for RecordingScheduler {
+            fn handle_alloc_job(
+                &self,
+                _: &dyn SchedulerOutgoing,
+                _: dist::Toolchain,
+            ) -> Result<AllocJobResult> {
+                unimplemented!()
+            }
+            fn handle_heartbeat_server(
+                &self,
+                server_id: ServerId,
+                _: dist::ServerNonce,
+                num_cpus: usize,
+                _: Box<dyn JobAuthorizer>,
+                active_jobs: Option<Vec<JobId>>,
+            ) -> Result<HeartbeatServerResult> {
+                let is_new = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert(server_id, (num_cpus, active_jobs))
+                    .is_none();
+                Ok(HeartbeatServerResult { is_new })
+            }
+            fn handle_deregister_server(&self, _: ServerId) -> Result<DeregisterServerResult> {
+                unimplemented!()
+            }
+            fn handle_update_job_state(
+                &self,
+                _: JobId,
+                _: ServerId,
+                _: dist::JobState,
+            ) -> Result<UpdateJobStateResult> {
+                unimplemented!()
+            }
+            fn handle_status(&self) -> Result<SchedulerStatusResult> {
+                unimplemented!()
+            }
+        }
+
+        struct AllowAll;
+        impl ClientAuthCheck for AllowAll {
+            fn check(&self, _: &str) -> StdResult<(), ClientVisibleMsg> {
+                Ok(())
+            }
+        }
+
+        fn self_signed_pem() -> Vec<u8> {
+            use openssl::asn1::Asn1Time;
+            use openssl::hash::MessageDigest;
+            use openssl::pkey::PKey;
+            use openssl::rsa::Rsa;
+            use openssl::x509::{X509, X509NameBuilder};
+
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "heartbeat-test").unwrap();
+            let name = name.build();
+            let mut b = X509::builder().unwrap();
+            b.set_version(2).unwrap();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(&name).unwrap();
+            b.set_pubkey(&key).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+                .unwrap();
+            b.sign(&key, MessageDigest::sha256()).unwrap();
+            b.build().to_pem().unwrap()
+        }
+
+        #[test]
+        fn heartbeat_route_registers_a_five_field_body() {
+            let registered: Registered = Default::default();
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let server_id = ServerId::new(SocketAddr::from(([127, 0, 0, 1], 9999)));
+            let scheduler = Scheduler::new(
+                addr,
+                RecordingScheduler(Arc::clone(&registered)),
+                Box::new(AllowAll),
+                Box::new(move |_| Some(server_id)),
+            );
+            // start() never returns, so the thread is left to die with the
+            // test process.
+            thread::spawn(move || scheduler.start());
+
+            let mut old = old_heartbeat();
+            old.cert_pem = self_signed_pem();
+            let body = bincode::serialize(&old).unwrap();
+            let client = reqwest::blocking::Client::new();
+            let url = format!("http://{addr}/api/v1/scheduler/heartbeat_server");
+            let mut status = None;
+            for _ in 0..100 {
+                match client
+                    .post(&url)
+                    .bearer_auth("token")
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Accept", "application/octet-stream")
+                    .body(body.clone())
+                    .send()
+                {
+                    Ok(resp) => {
+                        status = Some(resp.status());
+                        break;
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+            assert_eq!(status, Some(reqwest::StatusCode::OK));
+            let registered = registered.lock().unwrap();
+            assert_eq!(registered.get(&server_id), Some(&(old.num_cpus, None)));
+        }
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -1070,6 +1526,7 @@ mod client {
         SchedulerStatusResult, SubmitToolchainResult, Toolchain,
     };
 
+    use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::Compression;
@@ -1084,7 +1541,7 @@ mod client {
 
     use super::common::{
         AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, bincode_req_fut,
+        ServerCertificateHttpResponse, bincode_req_fut, scheduler_status_req_fut,
     };
     use super::urls;
     use crate::errors::*;
@@ -1093,18 +1550,32 @@ mod client {
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
 
+    // Map a config level to a zlib setting: 0 disables compression (for
+    // measurement on a fast LAN), 1-9 select the zlib level. Level 1 reproduces
+    // the historical `Compression::fast()` default.
+    fn run_job_compression(level: u32) -> Compression {
+        match level {
+            0 => Compression::none(),
+            l => Compression::new(l.min(9)),
+        }
+    }
+
     pub struct Client {
         auth_token: String,
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        client: Arc<Mutex<reqwest::Client>>,
+        client: Arc<ArcSwap<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
+        fallback: bool,
+        deserialize_offload_threshold: u64,
+        run_job_compression_level: u32,
     }
 
     impl Client {
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             pool: &tokio::runtime::Handle,
             scheduler_url: reqwest::Url,
@@ -1113,15 +1584,19 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            deserialize_offload_threshold: u64,
+            run_job_compression_level: u32,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
             let client = new_reqwest_client_builder()?
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
-                // Disable connection pool to avoid broken connection
-                // between runtime
-                .pool_max_idle_per_host(0)
+                // Keep a small idle pool so keep-alive connections are reused
+                // across coordination calls; expire them under the LAN idle
+                // limit to avoid reusing a half-closed socket.
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(90))
                 .build()
                 .context("failed to create an async HTTP client")?;
             let client_toolchains =
@@ -1131,15 +1606,24 @@ mod client {
                 auth_token,
                 scheduler_url,
                 server_certs: Default::default(),
-                client: Arc::new(Mutex::new(client)),
+                client: Arc::new(ArcSwap::from_pointee(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
+                fallback: true,
+                deserialize_offload_threshold,
+                run_job_compression_level,
             })
         }
 
+        /// Sets whether a failed or incomplete remote compile is recompiled locally.
+        pub fn with_fallback(mut self, fallback: bool) -> Self {
+            self.fallback = fallback;
+            self
+        }
+
         fn update_certs(
-            client: &mut reqwest::Client,
+            client: &ArcSwap<reqwest::Client>,
             certs: &mut HashMap<Vec<u8>, Vec<u8>>,
             cert_digest: Vec<u8>,
             cert_pem: Vec<u8>,
@@ -1159,12 +1643,15 @@ mod client {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
-                // Disable keep-alive
-                .pool_max_idle_per_host(0)
+                // Keep a small idle pool so keep-alive connections are reused;
+                // expire them under the LAN idle limit.
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(90))
                 .build()
                 .context("failed to create an async HTTP client")?;
-            // Use the updated certificates
-            *client = new_client_async;
+            // Hot-swap the client without holding a lock across the rebuild, so
+            // in-flight requests keep serving off the old client until the swap.
+            client.store(Arc::new(new_client_async));
             certs.insert(cert_digest, cert_pem);
             Ok(())
         }
@@ -1175,13 +1662,13 @@ mod client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url);
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = self.client.load().post(url);
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
             let client = self.client.clone();
             let server_certs = self.server_certs.clone();
 
-            match bincode_req_fut(req).await? {
+            match bincode_req_fut(req, self.deserialize_offload_threshold).await? {
                 AllocJobHttpResponse::Success {
                     job_alloc,
                     need_toolchain,
@@ -1200,10 +1687,11 @@ mod client {
                         server_id.addr()
                     );
                     let url = urls::scheduler_server_certificate(&scheduler_url, server_id);
-                    let req = client.lock().unwrap().get(url);
-                    let res: ServerCertificateHttpResponse = bincode_req_fut(req)
-                        .await
-                        .context("GET to scheduler server_certificate failed")?;
+                    let req = client.load().get(url);
+                    let res: ServerCertificateHttpResponse =
+                        bincode_req_fut(req, self.deserialize_offload_threshold)
+                            .await
+                            .context("GET to scheduler server_certificate failed")?;
 
                     // TODO: Move to asynchronous reqwest client only.
                     // This function internally builds a blocking reqwest client;
@@ -1216,7 +1704,7 @@ mod client {
                         .pool
                         .spawn_blocking(move || {
                             Self::update_certs(
-                                &mut client.lock().unwrap(),
+                                &client,
                                 &mut server_certs.lock().unwrap(),
                                 res.cert_digest,
                                 res.cert_pem,
@@ -1235,8 +1723,13 @@ mod client {
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_status(&scheduler_url);
-            let req = self.client.lock().unwrap().get(url);
-            bincode_req_fut(req).await
+            // The token earns the per-server list; the aggregate needs none.
+            let req = self
+                .client
+                .load()
+                .get(url)
+                .bearer_auth(self.auth_token.clone());
+            scheduler_status_req_fut(req).await
         }
 
         async fn do_submit_toolchain(
@@ -1247,12 +1740,22 @@ mod client {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
                     let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
-                    let req = self.client.lock().unwrap().post(url);
+                    let req = self.client.load().post(url);
                     let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
                     let body = Body::wrap_stream(toolchain_file_stream);
-                    let req = req.bearer_auth(job_alloc.auth).body(body);
-                    bincode_req_fut(req).await
+                    // This path streams the toolchain as an HTTP chunked body (no
+                    // Content-Length). tiny_http's chunked reader has no drop-drain,
+                    // and the server's submit handler has early returns that skip
+                    // reading the body (cache fast-path, JobNotFound), so keep-alive
+                    // here can desync a pooled connection on the server's unread
+                    // early-returns. Submits are rare and huge, so reuse is worth
+                    // ~nothing; force a close.
+                    let req = req
+                        .bearer_auth(job_alloc.auth)
+                        .header(reqwest::header::CONNECTION, "close")
+                        .body(body);
+                    bincode_req_fut(req, self.deserialize_offload_threshold).await
                 }
                 Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
                 Err(e) => Err(e),
@@ -1267,6 +1770,7 @@ mod client {
             inputs_packager: Box<dyn InputsPackager>,
         ) -> Result<(RunJobResult, PathTransformer)> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+            let compression = run_job_compression(self.run_job_compression_level);
 
             let (body, path_transformer) = self
                 .pool
@@ -1282,7 +1786,7 @@ mod client {
                         .expect("Infallible write of bincode body to vec failed");
                     let path_transformer;
                     {
-                        let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
+                        let mut compressor = ZlibWriteEncoder::new(&mut body, compression);
                         path_transformer = inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;
@@ -1298,9 +1802,9 @@ mod client {
                     Ok((body, path_transformer))
                 })
                 .await??;
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = self.client.load().post(url);
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
+            bincode_req_fut(req, self.deserialize_offload_threshold)
                 .map_ok(|res| (res, path_transformer))
                 .await
         }
@@ -1324,6 +1828,9 @@ mod client {
 
         fn rewrite_includes_only(&self) -> bool {
             self.rewrite_includes_only
+        }
+        fn fallback_enabled(&self) -> bool {
+            self.fallback
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {

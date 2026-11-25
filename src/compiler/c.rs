@@ -29,12 +29,12 @@ use crate::dist::pkg;
 use crate::mock_command::CommandCreatorSync;
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hash;
@@ -47,7 +47,16 @@ use std::sync::{Arc, LazyLock};
 use crate::errors::*;
 
 use super::CacheControl;
+#[cfg(feature = "dist-client")]
+use super::compiler::InflightGuard;
 use super::preprocessor_cache::PreprocessorCacheEntry;
+
+/// Live count of local preprocess (`cc1 -E`) invocations, gauged so the PC1
+/// preprocessing wall - the jobserver's cores saturated by preprocessing for
+/// the whole cluster while remote nodes idle - is a measured number rather than
+/// an inference.
+#[cfg(feature = "dist-client")]
+static PREPROC_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -163,6 +172,13 @@ struct CCompilation<I: CCompilerImpl> {
     preprocessor_stderr: Vec<u8>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
+    /// R0 instrumentation: wall-time spent running the local preprocessor
+    /// (`cc1 -E`) for this compile during hash-key generation, threaded into
+    /// the per-job dist log so the client-side preprocessing tax is timed
+    /// rather than inferred. `None` when no local preprocessing ran (input was
+    /// already preprocessed, or a preprocessor-cache hit skipped the run).
+    #[cfg(feature = "dist-client")]
+    preprocess_duration: Option<std::time::Duration>,
     executable: PathBuf,
     compiler: I,
     cwd: PathBuf,
@@ -347,6 +363,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         Box::new(CToolchainPackager {
             executable: self.executable.clone(),
             kind: self.compiler.kind(),
+            // `CCompiler` carries no compile environment; the standalone
+            // `--package-toolchain` path keeps resolving against the daemon's
+            // PATH. The dist-compile path threads the task env via
+            // `into_dist_packagers`.
+            env_vars: Vec::new(),
         })
     }
     fn parse_arguments(
@@ -418,7 +439,28 @@ where
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
-        let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        // An argument may name a file whose contents the compiler reads directly,
+        // making it an input the preprocessor never reports. A file we cannot hash
+        // leaves us unable to tell what the compilation depends on, so it must not
+        // be cached.
+        let mut cacheable = Cacheable::Yes;
+        let mut extra_hashes = Vec::with_capacity(self.parsed_args.extra_hash_files.len());
+        for path in &self.parsed_args.extra_hash_files {
+            match Digest::file(path, pool).await {
+                Ok(hash) => extra_hashes.push(hash),
+                Err(e) => {
+                    debug!(
+                        "[{}]: Not cacheable: cannot hash {:?}: {}",
+                        self.parsed_args.output_pretty(),
+                        path,
+                        e
+                    );
+                    cacheable = Cacheable::No;
+                    break;
+                }
+            }
+        }
+
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
         let assembler_digest = if self.parsed_args.uses_external_assembler {
@@ -456,9 +498,13 @@ where
         let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
 
         let use_preprocessor_cache_mode = if needs_preprocessing {
+            // Preprocessor cache mode maps include files to a hash key computed
+            // elsewhere, so it must not record one for a compilation whose key we
+            // already know is untrustworthy.
             let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
                 .use_preprocessor_cache_mode
-                && !too_hard_for_preprocessor_cache_mode;
+                && !too_hard_for_preprocessor_cache_mode
+                && cacheable == Cacheable::Yes;
 
             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
 
@@ -517,6 +563,8 @@ where
         } else {
             None
         };
+        #[cfg(feature = "dist-client")]
+        let mut preprocess_elapsed: Option<std::time::Duration> = None;
 
         let (preprocessor_output, preprocessor_stderr, include_files) = if needs_preprocessing {
             if let Some(preprocessor_key) = &preprocessor_key
@@ -557,19 +605,24 @@ where
                         // the toolchain will not contain the correct path
                         // to invoke the compiler! Add the compiler
                         // executable path to try and prevent this
-                        let weak_toolchain_key = format!(
-                            "{}-{}",
-                            self.executable.to_string_lossy(),
-                            self.executable_digest
+                        let weak_toolchain_key = c_weak_toolchain_key(
+                            &self.executable,
+                            &self.executable_digest,
+                            &env_vars,
                         );
                         return Ok(HashResult {
                             key,
+                            // Preprocessor cache mode is explicitly disabled for any
+                            // translation unit containing an `.incbin`.
+                            cacheable: Cacheable::Yes,
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
                                 preprocessor_stderr: Vec::new(),
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
+                                #[cfg(feature = "dist-client")]
+                                preprocess_duration: None,
                                 executable: self.executable.clone(),
                                 compiler: self.compiler.to_owned(),
                                 cwd: cwd.clone(),
@@ -583,6 +636,10 @@ where
                 }
             }
 
+            #[cfg(feature = "dist-client")]
+            let preprocess_start = std::time::Instant::now();
+            #[cfg(feature = "dist-client")]
+            let (preproc_guard, preproc_concurrency) = InflightGuard::enter(&PREPROC_INFLIGHT);
             let result = self
                 .compiler
                 .preprocess(
@@ -596,6 +653,17 @@ where
                     use_preprocessor_cache_mode,
                 )
                 .await;
+            #[cfg(feature = "dist-client")]
+            {
+                let elapsed = preprocess_start.elapsed();
+                preprocess_elapsed = Some(elapsed);
+                drop(preproc_guard);
+                info!(
+                    "preprocess done in {}ms (concurrent {})",
+                    elapsed.as_millis(),
+                    preproc_concurrency
+                );
+            }
             let out_pretty = self.parsed_args.output_pretty().into_owned();
             let result = result.map_err(|e| {
                 debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
@@ -679,6 +747,76 @@ where
             )
         };
 
+        // Files named by `.incbin` and `.include` are read by the assembler, so
+        // they are not part of the preprocessor output and have to be hashed
+        // separately. `.include` names assembly source, which can name further
+        // files in turn, so the queue grows as those are read.
+        let mut pending: VecDeque<_> = find_asm_dependencies(&preprocessor_output).into();
+        let mut included = HashSet::new();
+        while let Some(dependency) = pending.pop_front() {
+            let (tag, name, assembled_in_place) = match &dependency {
+                AsmDependency::Embedded(name) => ("incbin", name, false),
+                AsmDependency::Source(name) => ("include", name, true),
+                AsmDependency::Unparsable => {
+                    debug!(
+                        "[{}]: Not cacheable: an assembler directive names a file we cannot identify",
+                        self.parsed_args.output_pretty()
+                    );
+                    cacheable = Cacheable::No;
+                    break;
+                }
+            };
+
+            // gas resolves a relative operand against the working directory before
+            // consulting its own include path, so that is the only location we can
+            // resolve without replicating the assembler's search. An operand we
+            // cannot parse or a file we cannot hash makes the translation unit
+            // explicitly non-cacheable.
+            let path = decode_path(name).ok().map(|name| {
+                if name.is_absolute() {
+                    name
+                } else {
+                    cwd.join(name)
+                }
+            });
+
+            let hash = match &path {
+                // Included assembly is read rather than streamed, because the
+                // directives inside it have to be followed as well.
+                Some(path) if assembled_in_place => {
+                    if !included.insert(path.clone()) {
+                        // Already hashed and scanned: a repeated or cyclic include.
+                        continue;
+                    }
+                    match fs::read(path) {
+                        Ok(bytes) => {
+                            pending.extend(find_asm_dependencies(&bytes));
+                            Digest::reader_sync(&bytes[..]).ok()
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Some(path) => Digest::file(path, pool).await.ok(),
+                None => None,
+            };
+
+            match hash {
+                // Tagged so these digests cannot collide with each other or with an
+                // entry contributed by `extra_hash_files`.
+                Some(hash) => extra_hashes.push(format!("{tag}:{hash}")),
+                None => {
+                    debug!(
+                        "[{}]: Not cacheable: cannot hash {:?} named by a .{tag} directive",
+                        self.parsed_args.output_pretty(),
+                        path.as_deref()
+                            .unwrap_or(Path::new("<undecodable operand>"))
+                    );
+                    cacheable = Cacheable::No;
+                    break;
+                }
+            }
+        }
+
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
@@ -730,19 +868,19 @@ where
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
         // executable path to try and prevent this
-        let weak_toolchain_key = format!(
-            "{}-{}",
-            self.executable.to_string_lossy(),
-            self.executable_digest
-        );
+        let weak_toolchain_key =
+            c_weak_toolchain_key(&self.executable, &self.executable_digest, &env_vars);
         Ok(HashResult {
             key,
+            cacheable,
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
                 preprocessor_stderr,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
+                #[cfg(feature = "dist-client")]
+                preprocess_duration: preprocess_elapsed,
                 executable: self.executable.clone(),
                 compiler: self.compiler.clone(),
                 cwd,
@@ -793,6 +931,220 @@ fn read_preprocessor_cache_entry(
             None
         }
     }
+}
+
+const INCLUDE_DIRECTIVE: &[u8] = b".include";
+
+/// Upper bound on the length of a directive operand we are willing to parse.
+/// A file name longer than this is treated as unparsable rather than scanned to
+/// the end of the translation unit.
+const OPERAND_MAX_LEN: usize = 4096;
+
+/// A file an assembler directive pulls in, which the preprocessor never reports.
+#[derive(Debug, PartialEq, Eq)]
+enum AsmDependency {
+    /// `.incbin "file"`: the file's bytes are embedded verbatim.
+    Embedded(Vec<u8>),
+    /// `.include "file"`: the file is assembly source assembled in place, so it
+    /// can pull in further files itself.
+    Source(Vec<u8>),
+    /// A directive whose operand is not a plain quoted file name, leaving the
+    /// file it names unknown.
+    Unparsable,
+}
+
+/// The operand of an assembler directive that names a file.
+#[derive(Debug, PartialEq, Eq)]
+enum FileOperand {
+    /// The file name, exactly as written in the source.
+    Name(Vec<u8>),
+    /// The operand could not be parsed as a plain quoted file name.
+    Unparsable,
+}
+
+/// Whether the quotes around a directive operand are backslash-escaped.
+#[derive(Copy, Clone)]
+enum OperandQuoting {
+    /// `"file"`, as written directly in assembly.
+    Plain,
+    /// `\"file\"`, as written inside a C string literal in inline assembly.
+    Escaped,
+}
+
+/// Skips whitespace between an assembler directive and its operand.
+///
+/// Inside a C string literal the whitespace may be spelled as a two-character
+/// escape sequence rather than appearing literally, so both forms are accepted.
+fn skip_asm_whitespace(bytes: &[u8]) -> (&[u8], bool) {
+    let mut rest = bytes;
+    let mut skipped = false;
+    loop {
+        rest = match rest {
+            [b' ' | b'\t', tail @ ..] => tail,
+            [b'\\', b't' | b'n' | b'r' | b'f' | b'v' | b' ', tail @ ..] => tail,
+            _ => return (rest, skipped),
+        };
+        skipped = true;
+    }
+}
+
+/// Parses the file operand of a directive from the bytes that immediately follow
+/// the directive name, also returning how many of those bytes it spans.
+///
+/// Returns `None` if the name did not end where the caller thought it did, as in
+/// `.incbinary`.
+fn parse_file_operand(after_directive: &[u8]) -> Option<(FileOperand, usize)> {
+    // A directive name continuing past the one we matched is a different directive.
+    if after_directive
+        .first()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$'))
+    {
+        return None;
+    }
+
+    let (rest, skipped_whitespace) = skip_asm_whitespace(after_directive);
+    let (quoting, body) = if let Some(body) = rest.strip_prefix(b"\\\"") {
+        (OperandQuoting::Escaped, body)
+    } else if let Some(body) = rest.strip_prefix(b"\"") {
+        (OperandQuoting::Plain, body)
+    } else if skipped_whitespace {
+        // gas requires a quoted file name. Not finding one means the operand was
+        // produced some other way, so we cannot tell what this depends on.
+        return Some((FileOperand::Unparsable, 0));
+    } else {
+        return None;
+    };
+
+    let terminator: &[u8] = match quoting {
+        OperandQuoting::Plain => b"\"",
+        OperandQuoting::Escaped => b"\\\"",
+    };
+    let window = &body[..body.len().min(OPERAND_MAX_LEN)];
+    let mut end = None;
+    let mut i = 0;
+    while i < window.len() {
+        if window[i..].starts_with(terminator) {
+            end = Some(i);
+            break;
+        }
+        // A quote, backslash or newline before the terminator means the operand
+        // is escaped, concatenated or otherwise not a plain file name.
+        if matches!(window[i], b'"' | b'\\' | b'\n') {
+            break;
+        }
+        i += 1;
+    }
+
+    Some(match end {
+        Some(0) | None => (FileOperand::Unparsable, 0),
+        Some(end) => {
+            let spanned = after_directive.len() - body.len() + end + terminator.len();
+            (FileOperand::Name(window[..end].to_vec()), spanned)
+        }
+    })
+}
+
+/// Matches an assembler directive naming a file at the start of `slice`, also
+/// returning how many bytes of `slice` it spans.
+///
+/// Returns `None` if no such directive starts there.
+fn asm_dependency_at(slice: &[u8]) -> Option<(AsmDependency, usize)> {
+    let (wrap, directive_len, after_directive): (fn(Vec<u8>) -> AsmDependency, _, _) =
+        if let Some(rest) = slice.strip_prefix(INCBIN_DIRECTIVE) {
+            (AsmDependency::Embedded, INCBIN_DIRECTIVE.len(), rest)
+        } else {
+            let rest = slice.strip_prefix(INCLUDE_DIRECTIVE)?;
+            (AsmDependency::Source, INCLUDE_DIRECTIVE.len(), rest)
+        };
+
+    Some(match parse_file_operand(after_directive)? {
+        (FileOperand::Name(name), spanned) => (wrap(name), directive_len + spanned),
+        // The operand's extent is unknown, so resume right after the directive
+        // name; a spurious extra match is harmless once we are not caching.
+        (FileOperand::Unparsable, _) => (AsmDependency::Unparsable, directive_len),
+    })
+}
+
+/// Whether an assembler statement can begin at `pos` in `bytes`.
+///
+/// Missing a directive serves a stale object, which is not acceptable, so this is
+/// necessarily strict about ruling a position out. An identifier character in front
+/// of the directive makes this a C member access, and no gas statement can end in
+/// one. Every other position is treated as a statement start, which covers the
+/// line starts, whitespace, `;` separators and label colons used by gas.
+fn starts_asm_statement(bytes: &[u8], pos: usize) -> bool {
+    let before = &bytes[..pos];
+    let identifier_start = before
+        .iter()
+        .rposition(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$')))
+        .map_or(0, |end| end + 1);
+    if identifier_start == before.len() {
+        return true;
+    }
+    // Inline assembly writes the line break in front of a directive as a C escape
+    // sequence, whose own characters are identifier characters: "\n.incbin",
+    // "\012.incbin", "\x0a.incbin".
+    identifier_start > 0 && before[identifier_start - 1] == b'\\'
+}
+
+/// Finds every file an assembler directive pulls into `bytes`, in the order the
+/// directives appear.
+///
+/// `.incbin` and `.include` are handled by the assembler, not the preprocessor,
+/// so the files they name never appear in preprocessor output. Hashing that
+/// output alone therefore misses the dependency entirely: the named file can
+/// change while the cache key stays the same, and a stale object gets served,
+/// which we do not want.
+///
+/// `.include` names assembly source, so its contents have to be scanned in turn.
+/// That is the caller's job, since it is the one reading the files.
+///
+/// Comments are skipped: with `-frewrite-includes` they survive preprocessing, and
+/// the assembler never sees them. A kernel header comment that spells
+/// `.include <asm/nospec-branch.h>` would otherwise read as a directive with an
+/// operand we cannot identify and make nearly every kernel file uncacheable. A
+/// comment marker inside a string literal is not a comment, since inline assembly
+/// can carry one and a directive after it still has to be found.
+fn find_asm_dependencies(bytes: &[u8]) -> Vec<AsmDependency> {
+    let mut dependencies = Vec::new();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // An escape never ends a string, so step over the character it escapes.
+            b'\\' if in_string => {
+                i += 2;
+                continue;
+            }
+            // A line break ends a string too, so a stray quote in an assembly
+            // comment cannot hide comment markers on later lines.
+            b'"' | b'\n' if in_string => in_string = false,
+            b'"' => in_string = true,
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'*') => {
+                i = memchr::memmem::find(&bytes[i + 2..], b"*/")
+                    .map_or(bytes.len(), |end| i + 2 + end + 2);
+                continue;
+            }
+            b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr::memchr(b'\n', &bytes[i..]).map_or(bytes.len(), |end| i + end);
+                continue;
+            }
+            b'.' => {
+                if let Some((dependency, spanned)) =
+                    asm_dependency_at(&bytes[i..]).filter(|_| starts_asm_statement(bytes, i))
+                {
+                    dependencies.push(dependency);
+                    // Resume past the operand, so a file name that itself contains
+                    // ".incbin" or ".include" is not mistaken for another directive.
+                    i += spanned;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    dependencies
 }
 
 /// Remember the include files in the preprocessor output if it can be cached.
@@ -876,18 +1228,14 @@ fn process_preprocessed_file(
                     continue;
                 }
             }
-        } else if slice
-            .strip_prefix(INCBIN_DIRECTIVE)
-            .filter(|slice| {
-                slice.starts_with(b"\"") || slice.starts_with(b" \"") || slice.starts_with(b" \\\"")
-            })
-            .is_some()
-        {
-            // An assembler .inc bin (without the space) statement, which could be
-            // part of inline assembly, refers to an external file. If the file
-            // changes, the hash should change as well, but finding out what file to
-            // hash is too hard for sccache, so just bail out.
-            debug!("Found potential unsupported .inc bin directive in source code");
+        // The directive match runs first.
+        } else if asm_dependency_at(slice).is_some() && starts_asm_statement(bytes, start) {
+            // An assembler .inc bin or .include statement, which could be part of
+            // inline assembly, refers to an external file. Preprocessor cache mode
+            // keys on the include files alone and never sees the preprocessed
+            // output, so it cannot account for that file; `generate_hash_key`
+            // handles it for the normal path instead.
+            debug!("Found potential unsupported assembler file directive in source code");
             return Ok(false);
         } else if slice.starts_with(b"___________") && (start == 0 || bytes[start - 1] == b'\n') {
             // Unfortunately the distcc-pump wrapper outputs standard output lines:
@@ -1314,6 +1662,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             preprocessed_input,
             executable,
             compiler,
+            env_vars,
             ..
         } = *self;
         trace!("Dist inputs: {:?}", parsed_args.input);
@@ -1329,6 +1678,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
+            env_vars,
         });
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
@@ -1336,6 +1686,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
 
     fn is_locally_preprocessed(&self) -> bool {
         self.is_locally_preprocessed
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn preprocess_duration(&self) -> Option<std::time::Duration> {
+        self.preprocess_duration
     }
 
     fn cached_stdout(&self, stdout: Vec<u8>) -> Vec<u8> {
@@ -1388,10 +1743,14 @@ impl pkg::InputsPackager for CInputsPackager {
                 format!("unable to transform input path {}", input_path.display())
             })?;
 
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
+            let mut file_header = pkg::make_tar_header(&input_path)?;
             file_header.set_size(preprocessed_input.len() as u64); // The metadata is from non-preprocessed
-            file_header.set_cksum();
-            builder.append(&file_header, preprocessed_input.as_slice())?;
+            pkg::append_tar_entry(
+                &mut builder,
+                &mut file_header,
+                &dist_input_path,
+                preprocessed_input.as_slice(),
+            )?;
         }
 
         for input_path in extra_hash_files.iter().chain(extra_dist_files.iter()) {
@@ -1416,10 +1775,9 @@ impl pkg::InputsPackager for CInputsPackager {
             let mut output = vec![];
             io::copy(&mut file, &mut output)?;
 
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
+            let mut file_header = pkg::make_tar_header(&input_path)?;
             file_header.set_size(output.len() as u64);
-            file_header.set_cksum();
-            builder.append(&file_header, &*output)?;
+            pkg::append_tar_entry(&mut builder, &mut file_header, &dist_input_path, &*output)?;
         }
 
         // Finish archive
@@ -1428,11 +1786,103 @@ impl pkg::InputsPackager for CInputsPackager {
     }
 }
 
+/// Environment variables that decide which sub-tools and search directories a
+/// packaged C toolchain contains: the compile PATH its sub-tools resolve against
+/// and the variables the compiler consults when asked where its own tools live.
+const TOOLCHAIN_ENV_VARS: &[&str] = &["PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "LIBRARY_PATH"];
+
+/// Key under which a packaged toolchain is cached on the client. A compiler binary
+/// may be a symlink to another and so has the same digest, but the toolchain would
+/// not contain the path the compiler is invoked by, so the executable path is part
+/// of the key. The package also depends on the compile task's environment (see
+/// `TOOLCHAIN_ENV_VARS`), so those variables are too.
+fn c_weak_toolchain_key(
+    executable: &Path,
+    executable_digest: &str,
+    env_vars: &[(OsString, OsString)],
+) -> String {
+    let mut key = format!("{}-{}", executable.to_string_lossy(), executable_digest);
+    for name in TOOLCHAIN_ENV_VARS {
+        if let Some((_, value)) = env_vars.iter().find(|(k, _)| k == name) {
+            key.push_str(&format!("-{}={}", name, value.to_string_lossy()));
+        }
+    }
+    key
+}
+
+/// Resolve a program path reported by `-print-prog-name`/`-print-file-name`.
+/// Absolute paths are returned unchanged; a bare program name is resolved
+/// against `path_env` (the compile task's PATH) when supplied, so an OE native
+/// or cross gcc that reports a bare `as` packages the recipe's binutils rather
+/// than the build host's. Falls back to the daemon's PATH when no compile PATH
+/// is available.
+#[cfg(feature = "dist-client")]
+fn resolve_prog_in_path(raw: PathBuf, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    if raw.is_absolute() {
+        Some(raw)
+    } else if let Some(path) = path_env {
+        which::which_in(&raw, Some(path), std::env::current_dir().ok()?).ok()
+    } else {
+        which::which(raw).ok()
+    }
+}
+
+/// Ask the compiler where one of its own files or programs lives, via
+/// `-print-file-name=<name>` or `-print-prog-name=<name>` (`kind` is `file` or
+/// `prog`). The compiler runs with the compile task's environment, because
+/// variables such as COMPILER_PATH and GCC_EXEC_PREFIX change the answer. A bare
+/// answer is resolved against `path_env`, the task's PATH, or against the daemon's own
+/// PATH when `path_env` is `None`. Returns `None` when the compiler cannot run, exits
+/// non-zero, or names a program that is not on the PATH it is resolved against.
+#[cfg(feature = "dist-client")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn print_named_path(
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    path_env: Option<&OsStr>,
+    kind: &str,
+    name: &str,
+) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut output = process::Command::new(executable)
+        .arg(format!("-print-{}-name={}", kind, name))
+        .envs(env_vars.iter().cloned())
+        .output()
+        .ok()?;
+    debug!(
+        "find named {} {} output:\n{}\n===\n{}",
+        kind,
+        name,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    if !output.status.success() {
+        debug!("exit failure");
+        return None;
+    }
+
+    // Remove the trailing newline (if present)
+    if output.stdout.last() == Some(&b'\n') {
+        output.stdout.pop();
+    }
+
+    // Create our PathBuf from the raw bytes.  Relative paths are resolved against
+    // the compile task's PATH, falling back to the daemon's PATH when none was
+    // captured.
+    let path: PathBuf = OsString::from_vec(output.stdout).into();
+    resolve_prog_in_path(path, path_env)
+}
+
 #[cfg(feature = "dist-client")]
 #[allow(unused)]
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
+    env_vars: Vec<(OsString, OsString)>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -1442,45 +1892,28 @@ struct CToolchainPackager {
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        use std::os::unix::ffi::OsStringExt;
-
         info!("Generating toolchain {}", self.executable.display());
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         package_builder.add_common()?;
         package_builder.add_executable_and_deps(self.executable.clone())?;
 
-        // Helper to use -print-file-name and -print-prog-name to look up
-        // files by path.
+        // PATH from the compile task's environment. Resolving sub-tools against
+        // it (rather than the daemon's PATH) is what keeps an OE native or cross
+        // toolchain from packaging the build host's assembler.
+        let path_env = self
+            .env_vars
+            .iter()
+            .find(|(k, _)| k == OsStr::new("PATH"))
+            .map(|(_, v)| v.clone());
+
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
-            let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{}-name={}", kind, name))
-                .output()
-                .ok()?;
-            debug!(
-                "find named {} {} output:\n{}\n===\n{}",
+            print_named_path(
+                &self.executable,
+                &self.env_vars,
+                path_env.as_deref(),
                 kind,
                 name,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            if !output.status.success() {
-                debug!("exit failure");
-                return None;
-            }
-
-            // Remove the trailing newline (if present)
-            if output.stdout.last() == Some(&b'\n') {
-                output.stdout.pop();
-            }
-
-            // Create our PathBuf from the raw bytes.  Assume that relative
-            // paths can be found via PATH.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
-            if path.is_absolute() {
-                Some(path)
-            } else {
-                which::which(path).ok()
-            }
+            )
         };
 
         // Helper to add a named file/program by to the package.
@@ -1582,6 +2015,18 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
         "WATCHOS_DEPLOYMENT_TARGET",
         "SDKROOT",
         "CCC_OVERRIDE_OPTIONS",
+        // Selects which cc1/as the driver runs, so it changes the generated code
+        // without changing the driver binary we hash.
+        "COMPILER_PATH",
+        // Turns on -fcompare-debug, which changes what the compiler does.
+        "GCC_COMPARE_DEBUG",
+        // Adds include directories. Preprocessing reflects these, but preprocessor
+        // cache mode skips preprocessing and would keep matching the files it
+        // recorded before the search path changed.
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH",
+        "OBJC_INCLUDE_PATH",
     ]
     .iter()
     .map(OsStr::new)
@@ -1753,6 +2198,159 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_resolve_prog_in_path_honors_supplied_path() {
+        use crate::test::utils::mk_bin;
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_tc")
+            .tempdir()
+            .unwrap();
+        let prog = mk_bin(dir.path(), "sccache-fake-as").unwrap();
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+
+        // A bare program name resolves against the supplied compile PATH, not
+        // the daemon's PATH. This is the toolchain-packaging bug: an OE native
+        // or cross gcc reports a bare `as`, which must resolve to the recipe's
+        // binutils on the compile PATH, not the build host's /usr/bin/as.
+        let resolved =
+            resolve_prog_in_path(PathBuf::from("sccache-fake-as"), Some(path_env.as_os_str()));
+        assert_eq!(
+            resolved.map(|p| p.canonicalize().unwrap()),
+            Some(prog.clone())
+        );
+
+        // Without the compile PATH, the daemon PATH cannot find this program.
+        let unresolved = resolve_prog_in_path(PathBuf::from("sccache-fake-as"), None);
+        assert_eq!(unresolved, None);
+
+        // An absolute path passes through untouched.
+        let absolute = resolve_prog_in_path(prog.clone(), Some(path_env.as_os_str()));
+        assert_eq!(absolute, Some(prog));
+    }
+
+    // The toolchain packager asks the compiler where its own sub-tools live, and the
+    // answer depends on variables such as COMPILER_PATH and GCC_EXEC_PREFIX. Those
+    // come from the compile task, not from the daemon, so they must reach the
+    // compiler process: a compiler that reports the host's `as` instead of the
+    // recipe's would package the wrong assembler.
+    #[test]
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_print_named_path_runs_the_compiler_with_the_task_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_named")
+            .tempdir()
+            .unwrap();
+        // Answers -print-prog-name=<name> with <SCCACHE_FAKE_TOOLDIR>/<name>.
+        let compiler = dir.path().join("fake-cc");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\necho \"${SCCACHE_FAKE_TOOLDIR}/${1#-print-prog-name=}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let task_env = vec![(
+            OsString::from("SCCACHE_FAKE_TOOLDIR"),
+            dir.path().as_os_str().to_owned(),
+        )];
+        assert_eq!(
+            print_named_path(&compiler, &task_env, None, "prog", "as"),
+            Some(dir.path().join("as")),
+            "the compile task's environment must reach the compiler"
+        );
+
+        // With no task environment the same compiler answers differently, so the
+        // assertion above cannot be satisfied by the daemon's own environment.
+        assert_eq!(
+            print_named_path(&compiler, &[], None, "prog", "as"),
+            Some(PathBuf::from("/as"))
+        );
+    }
+
+    // A compiler that exits non-zero has nothing to report, and the packager
+    // skips that sub-tool rather than failing the whole toolchain.
+    #[test]
+    #[cfg(all(
+        feature = "dist-client",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn test_print_named_path_is_none_when_the_compiler_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("sccache_named_fail")
+            .tempdir()
+            .unwrap();
+        // The two scripts differ only in the exit status, so a `None` for one and a
+        // `Some` for the other can come from nothing but that status; a compiler that
+        // failed to spawn would give `None` for both.
+        let write_compiler = |name: &str, script: &str| {
+            let compiler = dir.path().join(name);
+            fs::write(&compiler, script).unwrap();
+            std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+            compiler
+        };
+        let working = write_compiler("working-cc", "#!/bin/sh\necho /usr/bin/as\n");
+        let failing = write_compiler("failing-cc", "#!/bin/sh\necho /usr/bin/as\nexit 1\n");
+
+        assert_eq!(
+            print_named_path(&working, &[], None, "prog", "as"),
+            Some(PathBuf::from("/usr/bin/as"))
+        );
+        assert_eq!(print_named_path(&failing, &[], None, "prog", "as"), None);
+    }
+
+    // The packaged toolchain resolves its sub-tools through the compile task's
+    // PATH and the compiler's own search variables, so a toolchain cached under a
+    // key that ignores them would be reused for a task whose sub-tools differ.
+    #[test]
+    fn test_weak_toolchain_key_follows_the_variables_that_shape_the_package() {
+        let exe = Path::new("/usr/bin/gcc");
+        let env = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            pairs.iter().map(|(k, v)| (k.into(), v.into())).collect()
+        };
+        let base = c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b")]));
+
+        assert_eq!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/c")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(
+                exe,
+                "abcd",
+                &env(&[("PATH", "/a:/b"), ("COMPILER_PATH", "/tools")])
+            )
+        );
+        // Variables that do not change which tools are found leave the key alone.
+        assert_eq!(
+            base,
+            c_weak_toolchain_key(exe, "abcd", &env(&[("PATH", "/a:/b"), ("HOME", "/root")]))
+        );
+        // The executable path and digest still separate symlinked compilers.
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(Path::new("/usr/bin/cc"), "abcd", &env(&[("PATH", "/a:/b")]))
+        );
+        assert_ne!(
+            base,
+            c_weak_toolchain_key(exe, "ef01", &env(&[("PATH", "/a:/b")]))
+        );
+    }
 
     #[test]
     fn test_same_content() {
@@ -2091,6 +2689,297 @@ mod test {
         t("Hpp");
         t("Mm");
         t("Cu");
+    }
+
+    /// Convenience for asserting on a source fragment holding a single directive.
+    fn asm_dependency(source: &str) -> Option<AsmDependency> {
+        let mut dependencies = find_asm_dependencies(source.as_bytes());
+        assert!(dependencies.len() <= 1, "expected at most one dependency");
+        dependencies.pop()
+    }
+
+    fn embedded_file(source: &str) -> Option<String> {
+        match asm_dependency(source) {
+            Some(AsmDependency::Embedded(name)) => Some(String::from_utf8(name).unwrap()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_asm_dependency_plain_assembly() {
+        // As written directly in a .S file.
+        assert_eq!(
+            embedded_file("\t.incbin \"certs/signing_key.x509\"\n"),
+            Some("certs/signing_key.x509".to_string())
+        );
+        // Tab between the directive and its operand, as in the kernel's rmpiggy.S.
+        assert_eq!(
+            embedded_file("\t.incbin\t\"realmode.bin\"\n"),
+            Some("realmode.bin".to_string())
+        );
+        // gas does not require any separator before a quoted operand.
+        assert_eq!(
+            embedded_file(".incbin\"blob.bin\""),
+            Some("blob.bin".to_string())
+        );
+        // A skip/count suffix does not change which file is embedded.
+        assert_eq!(
+            embedded_file(".incbin \"blob.bin\",16,32\n"),
+            Some("blob.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_include_is_source() {
+        // `.include` pulls in assembly source rather than embedding bytes, so it is
+        // distinguished: its contents have to be scanned for further directives.
+        assert_eq!(
+            asm_dependency("\t.include \"macros.s\"\n"),
+            Some(AsmDependency::Source(b"macros.s".to_vec()))
+        );
+        assert_eq!(
+            asm_dependency("\"\t.include \\\"macros.s\\\"\\n\""),
+            Some(AsmDependency::Source(b"macros.s".to_vec()))
+        );
+        // A longer directive that merely starts with ".include".
+        assert_eq!(asm_dependency(".included \"macros.s\""), None);
+        // Embedding and including the same file must not hash the same way.
+        assert_ne!(
+            asm_dependency(".incbin \"x\"\n"),
+            asm_dependency(".include \"x\"\n")
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_in_c_string_literal() {
+        // Inline assembly, where the operand's quotes are backslash-escaped. This
+        // is how the Linux kernel's kernel/configs.c embeds config_data.gz.
+        assert_eq!(
+            embedded_file("\"\t.incbin \\\"kernel/config_data.gz\\\"\t\\n\""),
+            Some("kernel/config_data.gz".to_string())
+        );
+        // Whitespace spelled as an escape sequence rather than appearing literally.
+        assert_eq!(
+            embedded_file("\"\\t.incbin\\t\\\"blob.bin\\\"\\n\""),
+            Some("blob.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_not_a_directive() {
+        // A longer directive that merely starts with ".incbin".
+        assert_eq!(asm_dependency(".incbinary \"blob.bin\""), None);
+        assert_eq!(asm_dependency(".incbin_data \"blob.bin\""), None);
+        // The bare word with no operand at all is not something we can attribute a
+        // file to, but neither is it a directive we recognize.
+        assert_eq!(asm_dependency(".incbin"), None);
+    }
+
+    #[test]
+    fn test_asm_dependency_unparsable_operands() {
+        let unparsable = |source| {
+            assert_eq!(
+                asm_dependency(source),
+                Some(AsmDependency::Unparsable),
+                "{source:?}"
+            );
+        };
+        // Not a quoted string: assembled from something we cannot evaluate.
+        unparsable(".incbin BLOB_PATH\n");
+        unparsable(".include MACRO_PATH\n");
+        // Operand split across two C string literals, which the compiler
+        // concatenates but we cannot.
+        unparsable("\".incbin \\\"bl\" \"ob.bin\\\"\\n\"");
+        // Never terminated.
+        unparsable(".incbin \"blob.bin\n");
+        // Empty file name.
+        unparsable(".incbin \"\"\n");
+        // An escape inside the file name.
+        unparsable(".incbin \"bl\\ob.bin\"\n");
+        // Longer than we are willing to scan.
+        let long = "x".repeat(OPERAND_MAX_LEN + 1);
+        unparsable(&format!(".incbin \"{long}\"\n"));
+    }
+
+    #[test]
+    fn test_asm_dependency_multiple_directives() {
+        // certs/system_certificates.S embeds two files in one translation unit,
+        // and both have to be accounted for.
+        let source = "__module_cert_start:\n\t.incbin \"certs/signing_key.x509\"\n\
+                      __module_cert_end:\n\t.incbin \"certs/x509_certificate_list\"\n\
+                      \t.include \"trailer.s\"\n";
+        assert_eq!(
+            find_asm_dependencies(source.as_bytes()),
+            vec![
+                AsmDependency::Embedded(b"certs/signing_key.x509".to_vec()),
+                AsmDependency::Embedded(b"certs/x509_certificate_list".to_vec()),
+                AsmDependency::Source(b"trailer.s".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_directive_name_inside_operand() {
+        // The scan resumes past the operand, so a file whose own name contains a
+        // directive name does not look like a second directive.
+        assert_eq!(
+            find_asm_dependencies(b"\t.incbin \"payload.incbin\"\n"),
+            vec![AsmDependency::Embedded(b"payload.incbin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"\t.include \"a.include\"\n\t.incbin \"b.bin\"\n"),
+            vec![
+                AsmDependency::Source(b"a.include".to_vec()),
+                AsmDependency::Embedded(b"b.bin".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_needs_a_statement_boundary() {
+        // A member access only spells a directive name.
+        assert!(find_asm_dependencies(b"opts.include = 1;\n").is_empty());
+        assert!(find_asm_dependencies(b"x = y.incbin + 1;\n").is_empty());
+        assert!(find_asm_dependencies(b"cfg->opts.incbin(path);\n").is_empty());
+        assert_eq!(
+            find_asm_dependencies(b"nop;.incbin \"blob.bin\"\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"payload:.incbin \"blob.bin\"\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        // A directive at the very start of a C string literal, which is how inline
+        // assembly is usually written.
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\".incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_after_an_escaped_line_break() {
+        // The line break in front of a directive in inline assembly is a C escape
+        // sequence, whose characters are identifier characters. Every spelling of
+        // it still has to reach the directive.
+        for line_break in ["\\n", "\\012", "\\x0a"] {
+            assert_eq!(
+                embedded_file(&format!("\"nop{line_break}.incbin \\\"blob.bin\\\"\"")),
+                Some("blob.bin".to_string()),
+                "{line_break}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_asm_dependency_in_string_literal_stays_parsimonious() {
+        // A string literal starting with a directive name is indistinguishable from
+        // inline assembly at this point, so it must be reported rather than skipped.
+        assert_eq!(
+            asm_dependency("printf(\".include %s\\n\", path);\n"),
+            Some(AsmDependency::Unparsable)
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_in_comment_is_ignored() {
+        // -frewrite-includes keeps comments, and the kernel's nospec-branch.h has
+        // one that spells an .include with a <...> operand. A comment reaches the
+        // assembler as nothing, so it names no file and must not stop caching.
+        assert!(
+            find_asm_dependencies(
+                b"/*\n * from C via asm(\".include <asm/nospec-branch.h>\") but no\n */\nint x;\n"
+            )
+            .is_empty()
+        );
+        assert!(find_asm_dependencies(b"int x; // .incbin \"blob.bin\"\n").is_empty());
+        assert!(find_asm_dependencies(b"/* .include \"a.s\" */ int x;\n").is_empty());
+    }
+
+    #[test]
+    fn test_asm_dependency_after_a_comment_is_still_found() {
+        assert_eq!(
+            find_asm_dependencies(b"/* .include <x> */\n\t.incbin \"blob.bin\"\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"// note\n\t.include \"a.s\"\n"),
+            vec![AsmDependency::Source(b"a.s".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_comment_marker_inside_string_is_not_a_comment() {
+        // Inline assembly can contain "/*" or "//" in a string. Treating it as the
+        // start of a comment would hide the directive after it and serve a stale
+        // object.
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"/* x \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"// x \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+        // An escaped quote does not end the string, so the comment marker after it
+        // is still inside it.
+        assert_eq!(
+            find_asm_dependencies(b"__asm__(\"\\\" /* \\n.incbin \\\"blob.bin\\\"\");\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_unterminated_comment_hides_nothing_before_it() {
+        assert_eq!(
+            find_asm_dependencies(b"\t.incbin \"blob.bin\"\n/* never closed .include <x>\n"),
+            vec![AsmDependency::Embedded(b"blob.bin".to_vec())]
+        );
+    }
+
+    #[test]
+    fn test_asm_dependency_absent() {
+        assert!(find_asm_dependencies(b"int main(void) { return 0; }\n").is_empty());
+        assert!(find_asm_dependencies(b"").is_empty());
+    }
+
+    #[test]
+    fn test_process_preprocessed_file_asm_directive_disables_preprocessor_cache() {
+        // Preprocessor cache mode keys on include files only and never sees the
+        // preprocessed output, so it cannot account for a file named by an
+        // assembler directive and has to be turned off for every form the scanner
+        // recognizes.
+        for source in [
+            "\t.incbin \"blob.bin\"\n",
+            "\t.incbin\t\"blob.bin\"\n",
+            "\"\t.incbin \\\"blob.bin\\\"\t\\n\"\n",
+            ".incbin BLOB_PATH\n",
+            "\t.include \"macros.s\"\n",
+            "\t.include\t\"macros.s\"\n",
+            "\"\t.include \\\"macros.s\\\"\t\\n\"\n",
+            ".include MACRO_PATH\n",
+        ] {
+            // Pad past the 7-byte minimum the scan loop requires.
+            let mut bytes = format!("# 1 \"test.c\"\n{source}          ").into_bytes();
+            let success = process_preprocessed_file(
+                Path::new("test.c"),
+                Path::new(""),
+                &mut bytes,
+                &mut HashMap::new(),
+                PreprocessorCacheModeConfig {
+                    use_preprocessor_cache_mode: true,
+                    skip_system_headers: true,
+                    ..Default::default()
+                },
+                std::time::SystemTime::now(),
+                StandardFsAbstraction,
+            )
+            .unwrap();
+            assert!(
+                !success,
+                "{source:?} should disable preprocessor cache mode"
+            );
+        }
     }
 
     #[test]

@@ -120,6 +120,12 @@ fn default_disk_cache_size() -> u64 {
 fn default_toolchain_cache_size() -> u64 {
     TEN_GIGS
 }
+fn default_client_deserialize_offload_threshold() -> u64 {
+    1024 * 1024
+}
+fn default_run_job_compression_level() -> u32 {
+    1
+}
 
 struct StringOrU64Visitor;
 
@@ -777,6 +783,10 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    pub fallback: bool,
+    #[serde(deserialize_with = "deserialize_size_from_str")]
+    pub client_deserialize_offload_threshold: u64,
+    pub run_job_compression_level: u32,
 }
 
 impl Default for DistConfig {
@@ -788,6 +798,9 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            fallback: true,
+            client_deserialize_offload_threshold: default_client_deserialize_offload_threshold(),
+            run_job_compression_level: default_run_job_compression_level(),
         }
     }
 }
@@ -1678,6 +1691,22 @@ pub mod server {
         pub scheduler_auth: SchedulerAuth,
         #[serde(default = "default_toolchain_cache_size")]
         pub toolchain_cache_size: u64,
+        // Advertise fewer cores than the hardware so the scheduler de-weights
+        // this node (main.rs load_weight). On the colocated node the real cores
+        // are also spent preprocessing for the whole cluster and packaging
+        // toolchains, which the scheduler cannot see; capping the advertised
+        // count reserves them. None = use the detected hardware count.
+        #[serde(default)]
+        pub num_cpus: Option<usize>,
+        // When this build server shares a host with the scheduler (the colocated
+        // orchestrator node that also runs the client's preprocessing and
+        // bitbake), reserve this fraction of its cores instead of advertising
+        // them all - computed from the node's own hardware so the same config is
+        // portable across cluster topologies. Defaults to 0.35 when unset;
+        // ignored on a pure remote server. An explicit `num_cpus` above overrides
+        // this with an absolute count.
+        #[serde(default)]
+        pub colocated_reserve_fraction: Option<f64>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3027,6 +3056,9 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                fallback: true,
+                client_deserialize_offload_threshold: 1024 * 1024,
+                run_job_compression_level: 1,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3093,6 +3125,8 @@ fn server_toml_parse() {
                 token: "my server's token".to_owned()
             },
             toolchain_cache_size: 10737418240,
+            num_cpus: None,
+            colocated_reserve_fraction: None,
         }
     );
 }
@@ -3127,6 +3161,16 @@ size = "7g"
             client_side_mode: false,
         }
     );
+}
+
+#[test]
+fn dist_fallback_toml_parse() {
+    let config: FileConfig = toml::from_str("[dist]\nfallback = false\n").expect("Is valid toml.");
+    assert!(!config.dist.fallback);
+
+    let config: FileConfig = toml::from_str("[dist]\nscheduler_url = \"http://1.2.3.4:10600\"\n")
+        .expect("Is valid toml.");
+    assert!(config.dist.fallback);
 }
 
 #[test]

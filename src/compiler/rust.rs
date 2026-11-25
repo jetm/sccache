@@ -1422,6 +1422,28 @@ impl FromArg for ArgTarget {
         ))
     }
 }
+/// Resolve a bare `--target <name>` against `RUST_TARGET_PATH` to the custom
+/// target-spec JSON it refers to, if one exists.
+///
+/// rustc resolves a bare target name by searching each `RUST_TARGET_PATH`
+/// directory for `<name>.json` (built-in targets have no file and are left
+/// alone). sccache-dist ships a target spec only when `--target` is a path, so
+/// a name-form custom target is invisible to the build server and the remote
+/// rustc aborts with "could not find specification for target". Resolving the
+/// name to its JSON path here lets the existing path-form machinery hash and
+/// ship the spec. `env_vars` and `cwd` are the compile's own, not the daemon's.
+fn resolve_target_json_in_path(
+    name: &str,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Option<PathBuf> {
+    let (_, rust_target_path) = env_vars.iter().find(|(k, _)| k == "RUST_TARGET_PATH")?;
+    // A relative entry is relative to the compile's directory, not to this daemon's.
+    std::env::split_paths(rust_target_path)
+        .map(|dir| cwd.join(dir).join(format!("{name}.json")))
+        .find(|candidate| candidate.is_file())
+}
+
 impl IntoArg for ArgTarget {
     fn into_arg_os_string(self) -> OsString {
         match self {
@@ -1793,7 +1815,15 @@ fn parse_arguments(
             Some(Target(target)) => match target {
                 ArgTarget::Path(json_path) => target_json = Some(json_path.to_owned()),
                 ArgTarget::Unsure(_) => cannot_cache!("target unsure"),
-                ArgTarget::Name(_) => (),
+                ArgTarget::Name(name) => {
+                    // Keep the name form (rustc records it as the target's
+                    // identity, matching the prebuilt std in the sysroot); we
+                    // ship the spec and repoint RUST_TARGET_PATH for the remote
+                    // instead. Resolving here lets the spec be hashed and shipped.
+                    if let Some(json_path) = resolve_target_json_in_path(name, cwd, env_vars) {
+                        target_json = Some(json_path);
+                    }
+                }
             },
             None => {
                 match arg {
@@ -2185,8 +2215,16 @@ where
                 })
                 // We also exclude `--target` if it specifies a path to a .json file. The file content
                 // is used as hash input below.
-                // If `--target` specifies a string, it continues to be hashed as part of the arguments.
-                .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
+                // If `--target` specifies a string, it continues to be hashed as part of the
+                // arguments, even when the name resolves to a spec file: rustc records the name as
+                // the target's identity, so two names over identical specs are different targets.
+                .filter(|&(arg, val)| {
+                    self.parsed_args.target_json.is_none()
+                        || arg != "--target"
+                        || !val
+                            .as_ref()
+                            .is_some_and(|v| Path::new(v).extension().is_some_and(|e| e == "json"))
+                })
                 // A few argument types were not passed in a deterministic order
                 // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
                 // out, sort them, and append them to the rest of the arguments.
@@ -2395,10 +2433,14 @@ where
             .into_iter()
             .chain(abs_externs)
             .chain(abs_staticlibs)
+            // Ship the custom target-spec JSON (if any) so a remote rustc can
+            // load it; without it a distributed compile fails to find the target.
+            .chain(self.parsed_args.target_json.iter().map(|p| cwd.join(p)))
             .collect();
 
         Ok(HashResult {
             key: m.finish(),
+            cacheable: Cacheable::Yes,
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
                 host: self.host.clone(),
@@ -2556,6 +2598,18 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                     "CARGO" | "CARGO_MANIFEST_DIR" => {
                         *v = path_transformer.as_dist(Path::new(v))?;
                     }
+                    "RUST_TARGET_PATH" => {
+                        // Repoint the target-spec search path at the shipped
+                        // copies so the remote rustc resolves a name-form
+                        // --target the same way the client did. The spec JSON is
+                        // shipped as a compile input above. The server is always
+                        // Linux, so the entries join with ':'.
+                        let mut dist_dirs = Vec::new();
+                        for dir in std::env::split_paths(v) {
+                            dist_dirs.push(path_transformer.as_dist(&dir)?);
+                        }
+                        *v = dist_dirs.join(":");
+                    }
                     _ => (),
                 }
             }
@@ -2697,6 +2751,208 @@ fn has_link_artifact_sibling(rlib: &Path) -> bool {
         dir.join(format!("{stem}.{ext}")).exists()
             || dir.join(format!("{unprefixed}.{ext}")).exists()
     })
+}
+
+/// Return a metadata-only archive for a trimmable rlib: an `ar` holding just
+/// its metadata members, in their original order, or `None` when the rlib has
+/// none.
+///
+/// Current rustc keeps metadata in `lib.rmeta` (plus `lib.rmeta-link` for
+/// linking metadata); older rustc used a single `rust.metadata.bin`. A
+/// dependent compile needs every one of them present. But a split-metadata
+/// sysroot (e.g. an OpenEmbedded target `rustlib/<triple>/lib`, whose std/core
+/// rlibs keep metadata in a sibling `.rmeta` and carry only object members) has
+/// no such member. Callers must ship the whole rlib in that case -- trimming it
+/// to nothing drops the crate and leaves a remote compile unable to find `std`.
+#[cfg(feature = "dist-client")]
+fn trimmed_rlib_metadata(input_path: &Path) -> Result<Option<Vec<u8>>> {
+    const METADATA_MEMBERS: [&[u8]; 3] = [b"lib.rmeta", b"lib.rmeta-link", b"rust.metadata.bin"];
+
+    let file = fs::File::open(input_path)?;
+    let mut archive = ar::Archive::new(file);
+    let mut metadata_ar = vec![];
+    let mut kept = false;
+    {
+        let mut ar_builder = ar::Builder::new(&mut metadata_ar);
+        while let Some(entry_result) = archive.next_entry() {
+            let mut entry = entry_result?;
+            if !METADATA_MEMBERS.contains(&entry.header().identifier()) {
+                continue;
+            }
+            let header = entry.header().clone();
+            ar_builder.append(&header, &mut entry)?;
+            kept = true;
+        }
+    }
+    Ok(kept.then_some(metadata_ar))
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_metadata() {
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+
+    // A split-metadata rlib (object members only, no rust.metadata.bin), as an
+    // OE target sysroot ships: must not trim to nothing -> None (ship whole).
+    let split = tmp.path().join("libcore-split.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&split).unwrap());
+        b.append(&ar::Header::new(b"foo.o".to_vec(), 3), &b"abc"[..])
+            .unwrap();
+    }
+    assert!(
+        trimmed_rlib_metadata(&split).unwrap().is_none(),
+        "an rlib without rust.metadata.bin must ship whole, not trim to nothing"
+    );
+
+    // A normal rlib with an embedded rust.metadata.bin -> trim to that member.
+    let embedded = tmp.path().join("libfoo-embedded.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&embedded).unwrap());
+        b.append(
+            &ar::Header::new(b"rust.metadata.bin".to_vec(), 4),
+            &b"META"[..],
+        )
+        .unwrap();
+        b.append(&ar::Header::new(b"foo.o".to_vec(), 3), &b"abc"[..])
+            .unwrap();
+    }
+    let trimmed = trimmed_rlib_metadata(&embedded).unwrap();
+    assert!(
+        trimmed.is_some(),
+        "an rlib with metadata should trim to Some"
+    );
+    assert!(
+        trimmed.unwrap().windows(4).any(|w| w == b"META"),
+        "the trimmed archive must contain the metadata member"
+    );
+}
+
+#[cfg(all(test, feature = "dist-client"))]
+fn trimmed_rlib_member_names(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut archive = ar::Archive::new(bytes);
+    let mut names = vec![];
+    while let Some(entry) = archive.next_entry() {
+        names.push(entry.unwrap().header().identifier().to_vec());
+    }
+    names
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_keeps_every_metadata_member() {
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let rlib = tmp.path().join("libmulti.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&rlib).unwrap());
+        b.append(&ar::Header::new(b"lib.rmeta".to_vec(), 4), &b"RMET"[..])
+            .unwrap();
+        b.append(&ar::Header::new(b"foo.o".to_vec(), 3), &b"abc"[..])
+            .unwrap();
+        b.append(
+            &ar::Header::new(b"lib.rmeta-link".to_vec(), 4),
+            &b"LINK"[..],
+        )
+        .unwrap();
+    }
+    let trimmed = trimmed_rlib_metadata(&rlib).unwrap().unwrap();
+    assert_eq!(
+        trimmed_rlib_member_names(&trimmed),
+        vec![b"lib.rmeta".to_vec(), b"lib.rmeta-link".to_vec()],
+        "both metadata members, in order, and no object member"
+    );
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_objects_only_ships_whole() {
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let rlib = tmp.path().join("libobjs.rlib");
+    {
+        let mut b = ar::Builder::new(fs::File::create(&rlib).unwrap());
+        b.append(&ar::Header::new(b"a.o".to_vec(), 1), &b"a"[..])
+            .unwrap();
+        b.append(&ar::Header::new(b"b.o".to_vec(), 1), &b"b"[..])
+            .unwrap();
+    }
+    assert!(trimmed_rlib_metadata(&rlib).unwrap().is_none());
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_trimmed_rlib_is_usable_by_rustc() {
+    use std::ffi::{OsStr, OsString};
+
+    let tmp = tempfile::Builder::new()
+        .prefix("sccache_trim")
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+
+    let run = |args: &[&OsStr]| {
+        let out = std::process::Command::new(&rustc)
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("rustc must be runnable");
+        assert!(
+            out.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    fs::write(dir.join("dep.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    fs::write(
+        dir.join("user.rs"),
+        "pub fn twice() -> u32 { dep::answer() * 2 }\n",
+    )
+    .unwrap();
+
+    let full_dir = dir.join("full");
+    let trimmed_dir = dir.join("trimmed");
+    let out_dir = dir.join("out");
+    for d in [&full_dir, &trimmed_dir, &out_dir] {
+        fs::create_dir(d).unwrap();
+    }
+
+    run(&[
+        OsStr::new("--crate-type=rlib"),
+        OsStr::new("--crate-name=dep"),
+        OsStr::new("--edition=2021"),
+        OsStr::new("--out-dir"),
+        full_dir.as_os_str(),
+        OsStr::new("dep.rs"),
+    ]);
+
+    let trimmed = trimmed_rlib_metadata(&full_dir.join("libdep.rlib"))
+        .unwrap()
+        .expect("a real rustc rlib has metadata members");
+    let trimmed_path = trimmed_dir.join("libdep.rlib");
+    fs::write(&trimmed_path, &trimmed).unwrap();
+
+    let mut extern_arg = OsString::from("dep=");
+    extern_arg.push(&trimmed_path);
+    run(&[
+        OsStr::new("--crate-type=rlib"),
+        OsStr::new("--crate-name=user"),
+        OsStr::new("--edition=2021"),
+        OsStr::new("--extern"),
+        extern_arg.as_os_str(),
+        OsStr::new("--out-dir"),
+        out_dir.as_os_str(),
+        OsStr::new("user.rs"),
+    ]);
 }
 
 #[test]
@@ -2853,6 +3109,24 @@ fn test_maybe_add_cargo_toml() {
     assert!(maybe_add_cargo_toml(&wgpu_lib, true).is_none());
 }
 
+/// Is `dir` a rustc target sysroot lib dir (`<sysroot>/lib/rustlib/<triple>/lib`)?
+///
+/// Such a dir holds the implicit sysroot crates (core, std, alloc, ...) that
+/// rustc injects but that never appear as `--extern` deps, so the crate-dep
+/// filter in `write_inputs` drops them. A cross-compile references the target's
+/// prebuilt std here via `-L`; the remote rustc needs those rlibs, so libs from
+/// this dir shape are shipped unconditionally. Anchored on the `rustlib/*/lib`
+/// tail so an ordinary `-L dependency=target/*/deps` dir still gets filtered.
+#[cfg(feature = "dist-client")]
+fn is_rustlib_target_libdir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == "lib")
+        && dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "rustlib")
+}
+
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     #[allow(clippy::cognitive_complexity)] // TODO simplify this method.
@@ -2935,6 +3209,9 @@ impl pkg::InputsPackager for RustInputsPackager {
         for crate_link_path in crate_link_paths {
             let crate_link_path =
                 pkg::simplify_path_and_dirs(&crate_link_path, &mut traversed_dirs)?;
+            // Ship every rlib from a target sysroot lib dir; its implicit
+            // sysroot crates are absent from the cargo dep-name set below.
+            let ship_all = is_rustlib_target_libdir(&crate_link_path);
             let dir_entries = match fs::read_dir(crate_link_path) {
                 Ok(iter) => iter,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -2956,12 +3233,14 @@ impl pkg::InputsPackager for RustInputsPackager {
                     };
                     // Without rustc dependency names, a hashless native library such as
                     // libz.so is indistinguishable from a hashless Rust artifact.
-                    if hashless && rlib_dep_reader_and_names.is_none() {
+                    // A target rustlib dir is exempt: its hashless libstd.rlib is a Rust crate.
+                    if hashless && !ship_all && rlib_dep_reader_and_names.is_none() {
                         continue;
                     }
                     if let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names {
-                        // We have a list of crate names we care about, see if this lib is a candidate
-                        if !dep_crate_names.contains(crate_name) {
+                        // We have a list of crate names we care about, see if this lib is a candidate.
+                        // A target rustlib dir is exempt: its sysroot crates never appear as deps.
+                        if !ship_all && !dep_crate_names.contains(crate_name) {
                             continue;
                         }
                     }
@@ -3014,30 +3293,26 @@ impl pkg::InputsPackager for RustInputsPackager {
         }
 
         for (input_path, dist_input_path) in all_tar_inputs.iter() {
-            let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
-            let file = fs::File::open(input_path)?;
-            if can_trim_rlibs && can_trim_this(input_path) {
-                let mut archive = ar::Archive::new(file);
-
-                while let Some(entry_result) = archive.next_entry() {
-                    let mut entry = entry_result?;
-                    if entry.header().identifier() != b"rust.metadata.bin" {
-                        continue;
-                    }
-                    let mut metadata_ar = vec![];
-                    {
-                        let mut ar_builder = ar::Builder::new(&mut metadata_ar);
-                        let header = entry.header().clone();
-                        ar_builder.append(&header, &mut entry)?;
-                    }
-                    file_header.set_size(metadata_ar.len() as u64);
-                    file_header.set_cksum();
-                    builder.append(&file_header, metadata_ar.as_slice())?;
-                    break;
-                }
+            let mut file_header = pkg::make_tar_header(input_path)?;
+            let trimmed = if can_trim_rlibs && can_trim_this(input_path) {
+                trimmed_rlib_metadata(input_path)?
             } else {
-                file_header.set_cksum();
-                builder.append(&file_header, file)?;
+                None
+            };
+            if let Some(metadata_ar) = trimmed {
+                file_header.set_size(metadata_ar.len() as u64);
+                pkg::append_tar_entry(
+                    &mut builder,
+                    &mut file_header,
+                    dist_input_path,
+                    metadata_ar.as_slice(),
+                )?;
+            } else {
+                // Either not trimmable, or a split-metadata rlib with no
+                // embedded metadata member -- ship the whole file so the remote
+                // gets the real crate (e.g. an OE target sysroot's std/core).
+                let file = fs::File::open(input_path)?;
+                pkg::append_tar_entry(&mut builder, &mut file_header, dist_input_path, file)?;
             }
         }
 
@@ -5190,6 +5465,49 @@ foo.rs:
         }
     }
 
+    // rustc records a bare `--target` name as the crate's target identity, so two
+    // names that resolve to byte-identical spec files still produce different
+    // artifacts. Only a path-form `--target` is replaced by its file's content in
+    // the key; a name has to stay in it.
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
+    fn test_different_target_names_with_identical_specs_hash_differently(
+        preprocessor_cache_mode: bool,
+    ) {
+        let f = TestFixture::new();
+        let specs = f.tempdir.path().join("specs");
+        fs::create_dir_all(&specs).unwrap();
+        fs::write(specs.join("alpha.json"), b"{\"llvm-target\":\"x\"}").unwrap();
+        fs::write(specs.join("beta.json"), b"{\"llvm-target\":\"x\"}").unwrap();
+        let env = [(
+            OsString::from("RUST_TARGET_PATH"),
+            specs.clone().into_os_string(),
+        )];
+        let key = |target: &'static str| {
+            hash_key(
+                &f,
+                &[
+                    "--emit",
+                    "link",
+                    "foo.rs",
+                    "--out-dir",
+                    "out",
+                    "--crate-name",
+                    "foo",
+                    "--crate-type",
+                    "lib",
+                    "--target",
+                    target,
+                ],
+                &env,
+                nothing,
+                preprocessor_cache_mode,
+            )
+        };
+
+        assert_ne!(key("alpha"), key("beta"));
+    }
+
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     fn test_equal_hashes_externs(preprocessor_cache_mode: bool) {
@@ -5906,5 +6224,209 @@ foo.rs:
             fs::read_to_string(unsimplified).unwrap(),
             "pub struct Mutex;\n"
         );
+    }
+
+    #[test]
+    fn test_parse_target_name_resolved_via_rust_target_path() {
+        // A bare `--target NAME` naming a custom target spec found on
+        // RUST_TARGET_PATH is resolved to that JSON path, so the spec is hashed
+        // and shipped and a remote rustc can load it (OE passes the target by
+        // name and relies on RUST_TARGET_PATH, which the build server lacks).
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-target-path")
+            .tempdir()
+            .unwrap();
+        let spec = tmp.path().join("aarch64-avocado-linux-gnu.json");
+        std::fs::write(&spec, b"{}").unwrap();
+        let env_vars = vec![(
+            OsString::from("RUST_TARGET_PATH"),
+            OsString::from(tmp.path()),
+        )];
+
+        let args = [
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "./src/lib.rs",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/out",
+            "--target",
+            "aarch64-avocado-linux-gnu",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+        let h = match parse_arguments(&args, ".".as_ref(), &env_vars) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+
+        // The spec is recorded for hashing + shipping, but --target keeps its
+        // name form so rustc's target identity still matches the prebuilt std.
+        assert_eq!(h.target_json, Some(spec));
+        assert!(h.arguments.contains(&Argument::WithValue(
+            "--target",
+            ArgData::Target(ArgTarget::Name("aarch64-avocado-linux-gnu".to_owned())),
+            ArgDisposition::Separated
+        )));
+    }
+
+    #[test]
+    fn test_parse_target_name_resolves_a_relative_rust_target_path_against_the_compile_cwd() {
+        // A relative RUST_TARGET_PATH entry is relative to the directory the compile
+        // runs in, not to the sccache daemon's own working directory.
+        let cwd = tempfile::Builder::new()
+            .prefix("rust-target-path-cwd")
+            .tempdir()
+            .unwrap();
+        std::fs::create_dir(cwd.path().join("specs")).unwrap();
+        let spec = cwd.path().join("specs/relative-target.json");
+        std::fs::write(&spec, b"{}").unwrap();
+        let env_vars = vec![(OsString::from("RUST_TARGET_PATH"), OsString::from("specs"))];
+        let args = [
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "./src/lib.rs",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/out",
+            "--target",
+            "relative-target",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+        let h = match parse_arguments(&args, cwd.path(), &env_vars) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+
+        assert_eq!(h.target_json, Some(spec));
+    }
+
+    #[test]
+    fn test_parse_target_name_unresolved_stays_name() {
+        // RUST_TARGET_PATH set but no matching <name>.json: the target stays a
+        // bare name and target_json is None. Guards builtins from being rewritten.
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-target-path")
+            .tempdir()
+            .unwrap();
+        let env_vars = vec![(
+            OsString::from("RUST_TARGET_PATH"),
+            OsString::from(tmp.path()),
+        )];
+
+        let args = [
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "./src/lib.rs",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/out",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+        let h = match parse_arguments(&args, ".".as_ref(), &env_vars) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+
+        assert!(h.target_json.is_none());
+        assert!(h.arguments.contains(&Argument::WithValue(
+            "--target",
+            ArgData::Target(ArgTarget::Name("x86_64-unknown-linux-gnu".to_owned())),
+            ArgDisposition::Separated
+        )));
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn shipped_lib_names(libdir: &Path) -> Vec<String> {
+        let packager = Box::new(RustInputsPackager {
+            env_vars: vec![],
+            crate_link_paths: vec![libdir.to_path_buf()],
+            crate_types: CrateTypes {
+                rlib: false,
+                staticlib: false,
+            },
+            inputs: vec![],
+            path_transformer: dist::PathTransformer::new(),
+            rlib_dep_reader: None,
+        });
+        let mut buf = vec![];
+        pkg::InputsPackager::write_inputs(packager, &mut buf).unwrap();
+        let mut archive = tar::Archive::new(buf.as_slice());
+        let mut names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let path = e.path().unwrap();
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    // With no rustc dependency names (a non-cargo build) a target sysroot still has
+    // to ship its hashless libstd.rlib, or every std-dependent crate fails remotely.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_inputs_packager_ships_hashless_sysroot_rlib_without_dep_names() {
+        let td = tempfile::Builder::new()
+            .prefix("sccache_test_rustlib")
+            .tempdir()
+            .unwrap();
+        let libdir = td.path().join("rustlib/aarch64-linux-gnu/lib");
+        fs::create_dir_all(&libdir).unwrap();
+        fs::write(libdir.join("libstd.rlib"), b"std").unwrap();
+        fs::write(libdir.join("libcore-0123456789abcdef.rlib"), b"core").unwrap();
+        assert_eq!(
+            vec!["libcore-0123456789abcdef.rlib", "libstd.rlib"],
+            shipped_lib_names(&libdir)
+        );
+    }
+
+    // Outside a target rustlib dir a hashless library is a native library such as
+    // libz.so and must stay out of the inputs when no dependency names are known.
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_inputs_packager_skips_hashless_native_lib_outside_rustlib() {
+        let td = tempfile::Builder::new()
+            .prefix("sccache_test_nativelib")
+            .tempdir()
+            .unwrap();
+        let libdir = td.path().join("usr/lib");
+        fs::create_dir_all(&libdir).unwrap();
+        fs::write(libdir.join("libz.so"), b"z").unwrap();
+        assert!(shipped_lib_names(&libdir).is_empty());
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_is_rustlib_target_libdir() {
+        // A target sysroot lib dir (holds the prebuilt std/core rlibs).
+        assert!(is_rustlib_target_libdir(Path::new(
+            "/work/recipe-sysroot/usr/lib/rustlib/aarch64-avocado-linux-gnu/lib"
+        )));
+        // An ordinary cargo dependency search path must stay filtered.
+        assert!(!is_rustlib_target_libdir(Path::new(
+            "/work/git/target/aarch64-avocado-linux-gnu/release/deps"
+        )));
+        // `lib` leaf without a `rustlib` grandparent is not a rustlib dir.
+        assert!(!is_rustlib_target_libdir(Path::new("/usr/lib")));
     }
 }

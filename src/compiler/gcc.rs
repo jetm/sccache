@@ -165,6 +165,11 @@ ArgData! { pub
     Coverage,
     ModuleOnlyFlag,
     ExtraHashFile(PathBuf),
+    // For arguments naming a file whose contents are an input, where the value is
+    // a path only when it contains a directory separator; otherwise the compiler
+    // resolves the bare name against a search path of its own that we cannot
+    // reproduce. Used by -fplugin and -specs.
+    ExtraHashFileRequiringPath(PathBuf),
     // Only valid for clang, but this needs to be here since clang shares gcc's arg parsing.
     // For -fmodule-file which can be either "path" or "name=path"
     ExtraHashFileClangModuleFile(OsString),
@@ -194,6 +199,9 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("--save-temps=cwd", TooHardFlag),
     flag!("--save-temps=obj", TooHardFlag),
     take_arg!("--serialize-diagnostics", PathBuf, Separated, SerializeDiagnostics),
+    // A spec file rewrites the command line, so it can change anything about the
+    // compilation while the arguments we hash stay the same.
+    take_arg!("--specs", PathBuf, CanBeConcatenated(b'='), ExtraHashFileRequiringPath),
     take_arg!("--sysroot", PathBuf, CanBeSeparated(b'='), PassThroughPath),
     take_arg!("-A", OsString, Separated, PassThrough),
     take_arg!("-B", PathBuf, CanBeSeparated, PassThroughPath),
@@ -236,7 +244,11 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-fno-profile-generate", TooHardFlag),
     flag!("-fno-profile-use", TooHardFlag),
     flag!("-fno-working-directory", PreprocessorArgumentFlag),
-    take_arg!("-fplugin", OsString, Concatenated(b'='), TooHard),
+    // A plugin's code runs as part of the compilation, so its contents are an
+    // input rather than just the path naming it. This also covers the one plugin
+    // that used to be singled out here, libcc1plugin, which is passed as a bare
+    // name and so lands in the same bucket as any other name we cannot resolve.
+    take_arg!("-fplugin", PathBuf, CanBeConcatenated(b'='), ExtraHashFileRequiringPath),
     flag!("-fprofile-arcs", ProfileGenerate),
     flag!("-fprofile-generate", ProfileGenerate),
     take_arg!("-fprofile-use", OsString, Concatenated, TooHard),
@@ -270,6 +282,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-save-temps", TooHardFlag),
     flag!("-save-temps=cwd", TooHardFlag),
     flag!("-save-temps=obj", TooHardFlag),
+    take_arg!("-specs", PathBuf, CanBeConcatenated(b'='), ExtraHashFileRequiringPath),
     take_arg!("-std", OsString, Concatenated(b'='), Standard),
     take_arg!("-stdlib", OsString, Concatenated(b'='), PreprocessorArgument),
     flag!("-trigraphs", PreprocessorArgumentFlag),
@@ -435,6 +448,7 @@ where
                 serialize_diagnostics = Some(path.clone());
             }
             Some(ExtraHashFile(_))
+            | Some(ExtraHashFileRequiringPath(_))
             | Some(ExtraHashFileClangModuleFile(_))
             | Some(PassThroughFlag)
             | Some(PreprocessorArgumentFlag)
@@ -519,6 +533,19 @@ where
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
             }
+            Some(ExtraHashFileRequiringPath(path)) => {
+                // Without a directory separator the compiler resolves this name
+                // itself, against its plugin directory or its spec search path. We
+                // cannot reproduce that, and guessing at the working directory
+                // could hash an unrelated file that happens to share the name.
+                // (Note: ccache queries the compiler with -print-file-name to resolve
+                // spec files, we settle for not caching.)
+                if path.components().count() < 2 {
+                    cannot_cache!("file argument without a path");
+                }
+                extra_hash_files.push(cwd.join(path));
+                &mut common_args
+            }
             Some(ExtraHashFileClangModuleFile(val)) => {
                 extra_hash_files.push(cwd.join(module_file_path(val)));
                 &mut common_args
@@ -583,6 +610,7 @@ where
             | Some(XClang(_))
             | Some(IntegratedAs)
             | Some(NoIntegratedAs)
+            | Some(ExtraHashFileRequiringPath(_))
             | Some(TooHard(_)) => cannot_cache!(
                 arg.flag_str()
                     .unwrap_or("Can't handle complex arguments through clang",)
@@ -659,6 +687,15 @@ where
         // We can't cache compilation without an input.
         None => cannot_cache!("no input file"),
     };
+    // Compiler feature-probes compile /dev/null (e.g. OpenSSL's
+    // `-Wa,--help ... -x assembler /dev/null`, which asks the assembler to
+    // print its help). They never produce a real object, so caching aborts
+    // when the missing output can't be zipped and swallows the probe's stdout,
+    // making the caller mis-detect the feature. Refuse to cache so sccache runs
+    // the compiler locally and the probe's output reaches the caller.
+    if Path::new(&input) == Path::new("/dev/null") {
+        cannot_cache!("/dev/null input");
+    }
     let language = match language {
         None => {
             let mut lang = Language::from_file_name(Path::new(&input));
@@ -1019,6 +1056,37 @@ fn without_output_files(args: &[OsString]) -> Vec<OsString> {
     kept
 }
 
+/// Autoconf and CMake configure-time feature probes must run locally, not
+/// distributed. autoconf compiles `conftest.<ext>`; CMake's `try_compile()`
+/// compiles generated sources inside a `CMakeScratch`/`CMakeTmp`/`TryCompile-*`
+/// scratch directory. These probes are tiny, run by the hundreds during
+/// `do_configure`, and are frequently *designed* to fail (detecting the absence
+/// of a feature). Distributing them ships a network round-trip per probe and,
+/// for the intentionally-failing ones, a dropped-output fallback - hundreds of
+/// wasted dispatches contending with real compiles for build-server slots, for
+/// no benefit: a probe's pass/fail result is identical whether it compiles
+/// locally or remotely, and a sub-second local compile beats the round-trip.
+/// distcc/icecc tolerate this only because their dispatch is cheaper. Detection
+/// keys on the autoconf input name and the CMake scratch directory rather than
+/// the generated probe source names (CheckSymbolExists.c, src.c, ...), which are
+/// not stable across CMake versions. A false positive is harmless: the compile
+/// merely runs locally (still cached), exactly as it would for any non-eligible
+/// recipe.
+#[cfg(feature = "dist-client")]
+fn is_configure_probe(input: &Path, cwd: &Path) -> bool {
+    if input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == "conftest")
+    {
+        return true;
+    }
+    cwd.components().any(|component| {
+        let part = component.as_os_str().to_str().unwrap_or_default();
+        part == "CMakeScratch" || part == "CMakeTmp" || part.starts_with("TryCompile-")
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_compile_commands<F>(
     path_transformer: &mut dist::PathTransformer,
@@ -1103,9 +1171,23 @@ where
     //    device preprocessor outputs and cannot compile preprocessed CUDA files.
     // 3. The dist command does not carry the -arch flags, so a multi-arch
     //    compilation would come back with a single-arch object.
+    // 4. Precompiled-header generation (the input is itself a header, e.g.
+    //    `gcc -c asmjit.hpp -o asmjit.hpp.gch`) must run locally. A .gch built
+    //    from preprocessed source on a remote builder captures a macro state
+    //    (notably __has_builtin, evaluated differently under -fpreprocessed)
+    //    that diverges from a native build and then breaks every consumer that
+    //    -includes the header. distcc refuses PCH for the same reason.
+    // 5. Autoconf/CMake configure feature-probes (conftest.c, CMake try_compile
+    //    sources under a CMakeScratch/CMakeTmp/TryCompile-* dir) run locally:
+    //    they are tiny, run by the hundreds during do_configure, and are often
+    //    designed to fail, so distributing them only wastes build-server slots
+    //    on round-trips whose result is identical to a local compile. See
+    //    is_configure_probe.
     let dist_command = if has_verbose_flag
         || parsed_args.language == Language::Cuda
         || parsed_args.is_multiarch()
+        || parsed_args.language.is_c_like_header()
+        || is_configure_probe(&parsed_args.input, cwd)
     {
         None
     } else {
@@ -1121,7 +1203,7 @@ where
             let rewrite_includes_only = rewrite_includes_only
                 && !(kind == CCompilerKind::Gcc
                     && parsed_args.language == Language::AssemblerToPreprocess);
-            if rewrite_includes_only || parsed_args.language.is_c_like_header() {
+            if rewrite_includes_only {
             } else if let Some(processed_lang) = parsed_args.language.to_c_preprocessed_language() {
                 language = Some(language_to_arg(processed_lang)?.into());
             } else if parsed_args.language.needs_c_preprocessing() {
@@ -1135,7 +1217,14 @@ where
             }
             arguments.extend(vec![
                 parsed_args.compilation_flag.clone().into_string().ok()?,
-                path_transformer.as_dist(&parsed_args.input)?,
+                // Match the path the inputs packager ships the preprocessed
+                // content at (CInputsPackager uses cwd.join(input) + simplify_path).
+                // parsed_args.input is relative for out-of-tree builds (e.g. OE's
+                // `../sources/foo.c`); passing it raw made the server look for the
+                // input at a path the package never placed it, failing with
+                // "No such file or directory". Absolutize+simplify so both agree.
+                path_transformer
+                    .as_dist(&dist::pkg::simplify_path(&cwd.join(&parsed_args.input)).ok()?)?,
                 "-o".into(),
                 path_transformer.as_dist(out_file)?,
             ]);
@@ -1658,6 +1747,29 @@ mod test {
     }
 
     #[test]
+    fn test_parse_arguments_dev_null_input_not_cached() {
+        // OpenSSL's assembler feature-probe compiles /dev/null:
+        //   gcc -Wa,--help -c -o null.o -x assembler /dev/null
+        // -Wa,--help makes the assembler print its help and exit without an
+        // object, so caching aborts when the missing output can't be zipped and
+        // swallows the probe's stdout - the caller then mis-detects
+        // --noexecstack support and emits exec-stack objects. Run it locally.
+        let args = stringvec![
+            "-Wa,--help",
+            "-c",
+            "-o",
+            "null.o",
+            "-x",
+            "assembler",
+            "/dev/null"
+        ];
+        assert_eq!(
+            CompilerArguments::CannotCache("/dev/null input", None),
+            parse_arguments_(args, false)
+        );
+    }
+
+    #[test]
     fn test_parse_arguments_depfile_for_preprocessed_c_clang() {
         let args = stringvec!["-c", "foo.i", "-o", "foo.o", "-MD", "-MF", "foo.d"];
         let ParsedArguments {
@@ -1954,6 +2066,72 @@ mod test {
             CompilerArguments::CannotCache("multiple input files", Some("[\"-fPIC\"]".to_string())),
             parse_arguments_clang(args, false)
         );
+    }
+
+    /// A gcc plugin's code runs as part of the compilation, so the object depends
+    /// on the plugin's contents, not just on the path naming it.
+    #[test]
+    fn test_parse_arguments_fplugin_hashes_the_plugin() {
+        for args in [
+            stringvec!["-c", "foo.c", "-o", "foo.o", "-fplugin=./plugin.so"],
+            stringvec!["-c", "foo.c", "-o", "foo.o", "-fplugin", "./plugin.so"],
+            stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "-fplugin=scripts/gcc-plugins/structleak_plugin.so"
+            ],
+        ] {
+            let a = match parse_arguments_(args.clone(), false) {
+                CompilerArguments::Ok(a) => a,
+                o => panic!("Got unexpected parse result: {o:?} for {args:?}"),
+            };
+            assert_eq!(1, a.extra_hash_files.len(), "{args:?}");
+        }
+    }
+
+    /// A spec file rewrites the command line, so its contents are an input even
+    /// though the arguments we hash do not change with it.
+    #[test]
+    fn test_parse_arguments_specs_hashes_the_spec_file() {
+        for args in [
+            stringvec!["-c", "foo.c", "-o", "foo.o", "-specs=./hardened.spec"],
+            stringvec!["-c", "foo.c", "-o", "foo.o", "-specs", "./hardened.spec"],
+            stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "--specs=/usr/lib/rpm/cc1.spec"
+            ],
+        ] {
+            let a = match parse_arguments_(args.clone(), false) {
+                CompilerArguments::Ok(a) => a,
+                o => panic!("Got unexpected parse result: {o:?} for {args:?}"),
+            };
+            assert_eq!(1, a.extra_hash_files.len(), "{args:?}");
+        }
+    }
+
+    /// A plugin or spec file named without a path is resolved by the compiler
+    /// against a search path of its own, so there is nothing for us to hash.
+    /// libcc1plugin is one of these.
+    #[test]
+    fn test_parse_arguments_file_argument_without_path_refused() {
+        for arg in [
+            "-fplugin=libcc1plugin",
+            "-fplugin=structleak_plugin.so",
+            "-specs=hardened.spec",
+        ] {
+            let args = stringvec!["-c", "foo.c", "-o", "foo.o", arg];
+            match parse_arguments_(args, false) {
+                CompilerArguments::CannotCache(reason, None) => {
+                    assert_eq!(reason, "file argument without a path", "{arg}");
+                }
+                o => panic!("Got unexpected parse result: {o:?} for {arg}"),
+            }
+        }
     }
 
     #[test]
@@ -2651,14 +2829,14 @@ mod test {
     #[test]
     fn test_parse_arguments_fplugin() {
         assert_eq!(
-            CompilerArguments::CannotCache("-fplugin", None),
+            CompilerArguments::CannotCache("file argument without a path", None),
             parse_arguments_(
                 stringvec!["-c", "foo.c", "-fplugin=plugin.so", "-o", "foo.o"],
                 false
             )
         );
         assert_eq!(
-            CompilerArguments::CannotCache("-fplugin", None),
+            CompilerArguments::CannotCache("file argument without a path", None),
             parse_arguments_(
                 stringvec!["-c", "foo.c", "-fplugin=libcc1plugin", "-o", "foo.o"],
                 false
@@ -3014,6 +3192,68 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compile_relative_input_dist_command_is_absolute() {
+        // Regression: the dist command must reference the same absolute, simplified
+        // input path the inputs packager ships the preprocessed content at
+        // (CInputsPackager uses cwd.join(input) + simplify_path). For out-of-tree
+        // builds the input is relative (e.g. OE's `../sources/foo.c`); passing it
+        // raw made the build-server look where the input was never placed, failing
+        // with "No such file or directory" (OE xz/glibc out-of-tree compiles).
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            uses_external_assembler: false,
+            input: "../foo.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            msvc_explicit_language: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_command, dist_command, _cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        let dist_command = dist_command.expect("relative input must still produce a dist command");
+        // No argument may carry an unresolved `..`: the input must be the simplified
+        // absolute path the packager ships, not the raw relative one.
+        assert!(
+            !dist_command.arguments.iter().any(|a| a.contains("..")),
+            "dist command still references a relative input: {:?}",
+            dist_command.arguments
+        );
+    }
+
+    #[test]
     fn test_compile_simple_verbose_short() {
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3228,6 +3468,163 @@ mod test {
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_pch_generation_never_dist() {
+        // Compiling a header (precompiled-header generation, e.g.
+        // `gcc -c asmjit.hpp -o asmjit.hpp.gch`) must never be distributed: a
+        // .gch built from preprocessed source / a remote toolchain captures a
+        // macro state (notably __has_builtin) that differs from a local build
+        // and then poisons every consumer that -includes the header. distcc
+        // refuses PCH for the same reason; we build it locally.
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            uses_external_assembler: false,
+            input: "asmjit.hpp".into(),
+            double_dash_input: false,
+            language: Language::CxxHeader,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "asmjit.hpp.gch".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            msvc_explicit_language: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let compiler = &f.bins[0];
+        // Compiler invocation.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+        let mut path_transformer = dist::PathTransformer::new();
+        let (command, dist_command, cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            // rewrite_includes_only=true: dist is enabled, yet a header still
+            // must not produce a dist command.
+            true,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        assert!(dist_command.is_none());
+        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(Cacheable::Yes, cacheable);
+        assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_conftest_never_dist() {
+        // Autoconf compiles `conftest.c` to probe for a feature; the probe is
+        // tiny and often designed to fail. It must run locally, never
+        // distributed, regardless of rewrite_includes_only (dist enabled).
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            uses_external_assembler: false,
+            input: "conftest.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "conftest.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            msvc_explicit_language: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let compiler = &f.bins[0];
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+        let mut path_transformer = dist::PathTransformer::new();
+        let (command, dist_command, cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            true,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        assert!(dist_command.is_none());
+        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(Cacheable::Yes, cacheable);
+        assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_is_configure_probe() {
+        use std::path::Path;
+        // autoconf: conftest.<ext> in any directory.
+        assert!(is_configure_probe(
+            Path::new("conftest.c"),
+            Path::new("/build/foo/1.0/foo-1.0")
+        ));
+        assert!(is_configure_probe(
+            Path::new("conftest.cpp"),
+            Path::new("/build/foo/1.0/foo-1.0")
+        ));
+        // CMake try_compile: generated source inside a scratch directory.
+        assert!(is_configure_probe(
+            Path::new("CheckSymbolExists.c"),
+            Path::new("/build/foo/1.0/build/CMakeFiles/CMakeScratch/TryCompile-aB3xZ9")
+        ));
+        assert!(is_configure_probe(
+            Path::new("src.c"),
+            Path::new("/build/foo/1.0/build/CMakeTmp")
+        ));
+        // A real translation unit in a normal build directory must distribute.
+        assert!(!is_configure_probe(
+            Path::new("list.c"),
+            Path::new("/build/foo/1.0/foo-1.0/src")
+        ));
     }
 
     #[test]
